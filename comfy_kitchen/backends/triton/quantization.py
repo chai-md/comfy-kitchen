@@ -858,164 +858,290 @@ def triton_quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_s
     return triton_quantize_rowwise(rotated_x)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
-        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-    ],
-    key=['m', 'n', 'k'],
-)
+_PY_HEADERS_FALLBACK = "/opt/py312-include"
+_PY_HEADERS_CHECKED = False
+
+
+def _ensure_python_headers() -> None:
+    """Make Python.h reachable for Triton's runtime C compile (once per process).
+
+    The check itself costs ~52 us (sysconfig + stat) and used to run on every
+    launch, which is a measurable share of a thin-M GEMM.
+    """
+    global _PY_HEADERS_CHECKED
+    if _PY_HEADERS_CHECKED:
+        return
+    import os
+    import sys
+    import sysconfig
+
+    inc = sysconfig.get_paths().get("include", "")
+    if not os.path.exists(os.path.join(inc, "Python.h")):
+        # Only a same-major.minor include dir is safe here: Triton's runtime driver
+        # compiles against version-specific PyObject internals, so borrowing another
+        # version's headers can corrupt the interpreter.
+        alt = os.path.join(_PY_HEADERS_FALLBACK, f"python{sys.version_info.major}.{sys.version_info.minor}")
+        if os.path.exists(os.path.join(alt, "Python.h")):
+            os.environ["CPATH"] = os.pathsep.join(
+                p for p in (alt, os.environ.get("CPATH")) if p
+            )
+    _PY_HEADERS_CHECKED = True
+
+
 @triton.jit
-def _int8_matmul_dequant_kernel(
-    # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
-    # Matrix Dimensions
-    m, n, k,
-    # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
-    group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
+def _int8_gemm_dequant_kernel(
+    a,
+    b,
+    xs,
+    ws,
+    bias,
+    resid,
+    rs,
+    c,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    sbn,
+    sbk,
+    scm,
+    scn,
+    ws_n,
+    rs_n,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
+    EVEN: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
+    """Fused INT8 GEMM + dequantization epilogue:
+    C[m, n] = (sum_k A[m, k] * B[n, k]) * xs[m] * ws[n] + bias[n]
+
+    With HAS_RESIDUAL it reproduces cutlass_int8_dequant_residual bit for bit:
+    C = residual + rs[n] * round_out(acc * xs * ws + bias)
+    where the bias add is rounded to the output dtype *before* the rscale multiply
+    (CUTLASS FusedInt8GemmResidual Add2 -> Mul3 -> Add4 visitor chain).
     """
-    Computes: C = ((A * B) * (scale_a * scale_b)) + bias
-    A: [m, k] int8
-    B: [n, k] int8 (Transposed physically or logically via strides)
+    pid = tl.program_id(0)
+    npm = tl.cdiv(M, BM)
+    npn = tl.cdiv(N, BN)
+    gid = pid // (G * npn)
+    fm = gid * G
+    gs = min(npm - fm, G)
+    pm = fm + (pid % gs)
+    pn = (pid % (G * npn)) // gs
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    # int64 offsets: M*N or M*K past 2^31 elements (CFG batches, long clips) would wrap in int32
+    rm64 = rm.to(tl.int64)
+    rn64 = rn.to(tl.int64)
+    A = a + rm64[:, None] * sam + rk[None, :] * sak
+    B = b + rn64[None, :] * sbn + rk[:, None] * sbk
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for k0 in range(0, K, BK):
+        if EVEN:  # M, N, K are tile multiples: unmasked loads
+            acc += tl.dot(tl.load(A), tl.load(B))
+        elif EVEN_K:  # only K is a tile multiple: row/column masks only
+            acc += tl.dot(
+                tl.load(A, mask=rm[:, None] < M, other=0),
+                tl.load(B, mask=rn[None, :] < N, other=0),
+            )
+        else:
+            km = (k0 + rk) < K
+            acc += tl.dot(
+                tl.load(A, mask=(rm[:, None] < M) & km[None, :], other=0),
+                tl.load(B, mask=(rn[None, :] < N) & km[:, None], other=0),
+            )
+        A += BK * sak
+        B += BK * sbk
+    out = acc.to(tl.float32) * tl.load(xs + rm, mask=rm < M, other=0.0)[:, None]
+    out = out * tl.load(ws + rn * ws_n, mask=rn < N, other=0.0)[None, :]
+    if HAS_BIAS:
+        out += tl.load(bias + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+    elif HAS_RESIDUAL:
+        # CUTLASS always runs its Bias visitor (zero default), and (-0.0) + (+0.0)
+        # is +0.0; skipping the add would keep the sign bit on a zero product.
+        out = out + 0.0
+    out_ty = c.dtype.element_ty
+    if HAS_RESIDUAL:
+        # Add2 rounds to the output dtype even when bias is absent (CUTLASS always
+        # runs the Bias visitor, with a zero default), then Mul3 + Add4 run in fp32.
+        out = out.to(out_ty).to(tl.float32)
+        out = out * tl.load(rs + rn * rs_n, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+        out = out + tl.load(
+            resid + rm64[:, None] * scm + rn64[None, :] * scn,
+            mask=(rm[:, None] < M) & (rn[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+    C = c + rm64[:, None] * scm + rn64[None, :] * scn
+    tl.store(C, out.to(out_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+# While the int8 weight fits in L2 it is re-read from cache once per M-tile, so the
+# tile shape decides throughput; past that point the kernel is bandwidth-bound on B
+# and splitting M only adds masked tail work. Measured on GB10: 4096x4096 (=16 MB)
+# gains up to 2x from thin tiles, 5120x5120 (=26 MB) and 10240x4096 (=41 MB) stay
+# flat within 4%.
+_INT8_L2_WEIGHT_ELEMS = 20 << 20
+_INT8_GB10_DEFAULT_TILE = (128, 128, 64, 8, 8, 4)
+# 64 KB shared-memory devices (sm_75, RDNA1-4): 4 stages x (128*64 + 64*128) bytes
+# is exactly 64 KB and fails to compile. Halving BK keeps the CTA shape at 32 KB.
+_INT8_PORTABLE_TILE = (128, 128, 32, 8, 8, 4)
+# The residual epilogue loads a second [BM, BN] tile and converts it to fp32, which
+# doubles register pressure; a half-width N tile recovers it (measured: 128x64 is
+# 8-12% faster than 128x128 for the residual form and never slower).
+_INT8_GB10_RESIDUAL_TILE = (128, 64, 64, 8, 8, 4)
+_DEVICE_CAPABILITY: dict[int, tuple[int, int]] = {}
+
+
+def _device_capability(device_index: int = 0) -> tuple[int, int]:
+    """Cached (major, minor) for the device, or (-1, -1) when it cannot be queried."""
+    cap = _DEVICE_CAPABILITY.get(device_index)
+    if cap is None:
+        try:
+            props = torch.cuda.get_device_properties(device_index)
+            cap = (int(props.major), int(props.minor))
+        except Exception:  # ROCm/XPU/CPU: no CUDA properties
+            cap = (-1, -1)
+        _DEVICE_CAPABILITY[device_index] = cap
+    return cap
+
+
+def _int8_tile_config(
+    m: int, n: int, k: int, capability: tuple[int, int] | None = None,
+    residual: bool = False,
+) -> tuple[int, int, int, int, int, int]:
+    """Pick (BM, BN, BK, G, num_warps, num_stages) for this GEMM shape.
+
+    GB10 (sm_121) has 48 SMs. The 128x128 tile needs M to be a multiple of 128;
+    otherwise the last M-tile is partly empty and the CTA count stops matching the
+    SM count (M=160 -> 2x32 = 64 CTAs = 1.33 waves, measured 1.6x slower than a
+    64-row tile). Tile choice never changes the result: the int32 accumulation is
+    exact and the dequant epilogue runs per output element, so every band below is
+    bit-identical to the 128x128 kernel.
+
+    Band boundaries are min-of-N measurements on GB10 (n=k=4096; the weight fits in
+    L2 there, which is the regime where the tile matters at all). Other devices keep
+    the generic tile: this Triton backend also serves ROCm/XPU, where the GB10 bands
+    are unmeasured.
     """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(m, block_m)
-    num_pid_n = tl.cdiv(n, block_n)
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
-    pid_m = first_pid_m + (pid % actual_group_size_m)
-    pid_n = (pid % num_pid_in_group) // actual_group_size_m
+    if capability is None:
+        capability = _device_capability()
+    if capability != (12, 1):
+        return _INT8_PORTABLE_TILE
+    if m >= 288 or n * k > _INT8_L2_WEIGHT_ELEMS:
+        return _INT8_GB10_RESIDUAL_TILE if residual else _INT8_GB10_DEFAULT_TILE
+    if m >= 208:
+        return 128, 64, 64, 8, 8, 4   # 208-287: beats 128x128 by ~1.15x
+    if m >= 128:
+        return 64, 128, 64, 8, 4, 4   # 128-207: 1.6x
+    return 64, 64, 64, 8, 4, 4        # <128: 1.6-1.7x
 
-    # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
-    offs_k = tl.arange(0, block_k)
 
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+def triton_int8_gemm_dequant(
+    x8: torch.Tensor,
+    w8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> bool:
+    """Launch fused INT8 GEMM + dequantization epilogue in Triton.
 
-    # 2. Main Loop (Accumulate in Int32)
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_idx in range(0, tl.cdiv(k, block_k)):
-        # Load chunks
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
-
-        # Matrix Multiply
-        accumulator += tl.dot(a, b)
-
-        # Advance pointers
-        a_ptrs += block_k * stride_ak
-        b_ptrs += block_k * stride_bk
-
-    # 3. Fused Epilogue (Dequantize & Bias)
-    scale_a = tl.load(a_scale_ptr + offs_am) # Vector [BLOCK_M]
-    scale_b = tl.load(b_scale_ptr)
-
-    c = accumulator.to(tl.float32)
-    total_scale = scale_a[:, None] * scale_b
-    c = c * total_scale
-
-    if has_bias:
-        bias = tl.load(bias_ptr + offs_bn) # Vector [BLOCK_N]
-        c = c + bias[None, :]
-
-    # 4. Store Result
-    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-@triton.autotune(
-    configs=[
-        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
-        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-    ],
-    key=['m', 'n', 'k'],
-)
-@triton.jit
-def _int8_matmul_dequant_per_row_kernel(
-    # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
-    # Matrix Dimensions
-    m, n, k,
-    # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
-    group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
-):
+    Applies the same float operations in the same order as CUTLASS
+    ``cutlass_int8_dequant``: ``(int32 -> fp32 * x_scale * w_scale + bias) -> out.dtype``.
+    With ``residual`` it matches ``cutlass_int8_dequant_residual``:
+    ``out = residual + residual_scale * round_out(acc * x_scale * w_scale + bias)``.
     """
-    Computes: C = ((A * B) * (scale_a[:, None] * scale_b[None, :])) + bias
-    A: [m, k] int8, scale_a: [m, 1] per-row activation scales
-    B: [n, k] int8, scale_b: [n, 1] per-row weight scales
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(m, block_m)
-    num_pid_n = tl.cdiv(n, block_n)
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
-    pid_m = first_pid_m + (pid % actual_group_size_m)
-    pid_n = (pid % num_pid_in_group) // actual_group_size_m
+    if residual is not None:
+        if (
+            residual.dtype != out.dtype
+            or not residual.is_contiguous()
+            or residual.shape != out.shape
+            or residual.stride() != out.stride()
+            or residual_scale is None
+            or residual_scale.dtype != out.dtype
+            or not residual_scale.is_contiguous()
+            or residual_scale.numel() not in (1, out.shape[1])
+        ):
+            return False
+    _ensure_python_headers()
+    M, K = x8.shape
+    N = w8.shape[0]
+    if M == 0 or N == 0:
+        return True
+    if K == 0:
+        if bias is not None and bias.numel() > 0:
+            out.copy_(bias.reshape(1, N).expand(M, N))
+        else:
+            out.zero_()
+        return True
+    xs = x_scale.reshape(-1).contiguous()
+    ws = w_scale.reshape(-1).contiguous()
+    ws_n = 0 if ws.numel() == 1 else 1
+    # The kernel reads these as flat, stride-1 vectors: materialise them rather than
+    # trusting a direct caller (expand()/slices produce numel == n with stride 0).
+    if bias is not None and bias.numel() > 0:
+        has_bias = True
+        bias_arg = bias.reshape(-1).contiguous()
+    else:
+        has_bias = False
+        bias_arg = out
+    if residual is not None and residual_scale is not None:
+        has_residual = True
+        resid_arg = residual
+        rs = residual_scale.reshape(-1).contiguous()
+        rs_n = 0 if rs.numel() == 1 else 1
+    else:
+        has_residual = False
+        resid_arg = out
+        rs = out
+        rs_n = 0
+    BM, BN, BK, G, num_warps, num_stages = _int8_tile_config(M, N, K, residual=has_residual)
+    # Unmasked K loop when every dim (or K) is a tile multiple.
+    even_k = K % BK == 0
+    even = even_k and M % BM == 0 and N % BN == 0
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+    _int8_gemm_dequant_kernel[grid](
+        x8,
+        w8,
+        xs,
+        ws,
+        bias_arg,
+        resid_arg,
+        rs,
+        out,
+        M,
+        N,
+        K,
+        x8.stride(0),
+        x8.stride(1),
+        w8.stride(0),
+        w8.stride(1),
+        out.stride(0),
+        out.stride(1),
+        ws_n,
+        rs_n,
+        HAS_BIAS=has_bias,
+        HAS_RESIDUAL=has_residual,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        G=G,
+        EVEN=even,
+        EVEN_K=even_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return True
 
-    # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
-    offs_k = tl.arange(0, block_k)
-
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # 2. Main Loop (Accumulate in Int32)
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_idx in range(0, tl.cdiv(k, block_k)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
-        accumulator += tl.dot(a, b)
-        a_ptrs += block_k * stride_ak
-        b_ptrs += block_k * stride_bk
-
-    # 3. Fused Epilogue (Dequantize & Bias)
-    scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
-    scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
-
-    c = accumulator.to(tl.float32)
-    total_scale = scale_a[:, None] * scale_b[None, :]
-    c = c * total_scale
-
-    if has_bias:
-        bias = tl.load(bias_ptr + offs_bn)
-        c = c + bias[None, :]
-
-    # 4. Store Result
-    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
-    tl.store(c_ptrs, c, mask=c_mask)
 
 def int8_linear(
     x: torch.Tensor,
@@ -1057,7 +1183,7 @@ def int8_linear(
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
-    m, k = x_2d.shape
+    m, _k = x_2d.shape
     n = weight.shape[0]
 
     # Quantize input per-row using fused or normal quantization kernel
@@ -1070,48 +1196,14 @@ def int8_linear(
 
     output = torch.empty((m, n), device=x.device, dtype=out_dtype)
 
-    is_per_channel = False
     if not isinstance(weight_scale, torch.Tensor):
         weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
     elif weight_scale.numel() == 1:
-        weight_scale = weight_scale.reshape(1)
+        weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(1)
     else:
-        is_per_channel = True
-        weight_scale = weight_scale.reshape(n).contiguous()
+        weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(n).contiguous()
 
-    has_bias = bias is not None
-    bias_ptr = bias if has_bias else x
-
-    def grid(meta):
-        return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
-
-    if is_per_channel:
-        _int8_matmul_dequant_per_row_kernel[grid](
-            a_ptr=x_int8,
-            b_ptr=weight,
-            c_ptr=output,
-            a_scale_ptr=x_scale,
-            b_scale_ptr=weight_scale,
-            bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
-            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
-            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
-            stride_cm=output.stride(0), stride_cn=output.stride(1),
-            has_bias=has_bias
-        )
-    else:
-        _int8_matmul_dequant_kernel[grid](
-            a_ptr=x_int8,
-            b_ptr=weight,
-            c_ptr=output,
-            a_scale_ptr=x_scale,
-            b_scale_ptr=weight_scale,
-            bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
-            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
-            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
-            stride_cm=output.stride(0), stride_cn=output.stride(1),
-            has_bias=has_bias
-        )
+    bias_arg = bias.to(device=x.device).contiguous() if bias is not None else None
+    triton_int8_gemm_dequant(x_int8, weight, x_scale, weight_scale, bias_arg, output)
 
     return _apply_residual(output.reshape(*orig_shape[:-1], n), residual, residual_scale)

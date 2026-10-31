@@ -1155,6 +1155,29 @@ def int8_linear(
     """
     if out_dtype is None:
         out_dtype = torch.bfloat16
+    # The custom op has no autograd formula and its meta function ignores residual
+    # broadcasting, so only the plain inference call takes the fast path under
+    # torch.compile; anything else keeps tracing the Python implementation.
+    if torch.compiler.is_compiling() and residual is None and not any(
+        getattr(t, "requires_grad", False)
+        for t in (x, weight, bias, input_act_weight, residual_scale)
+    ):
+        if not isinstance(weight_scale, torch.Tensor):
+            weight_scale = torch.tensor(weight_scale, device=x.device, dtype=torch.float32)
+        return torch.ops.comfy_kitchen.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            DTYPE_TO_CODE[out_dtype],
+            convrot,
+            convrot_groupsize,
+            input_act,
+            input_act_weight,
+            input_act_eps,
+            residual,
+            residual_scale,
+        )
     kwargs = {
         "x": x,
         "weight": weight,
