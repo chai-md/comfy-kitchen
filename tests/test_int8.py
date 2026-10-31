@@ -1113,3 +1113,482 @@ class TestBandedStreamK:
         m = 9216                                          # 75.5 MB
         assert pick(m, n, k) == (13 if m * k > threshold else 0)
         assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute
+
+
+class TestTritonInt8GemmDequant:
+    """Tests for GB10 (sm_121) Triton fused-dequant INT8 GEMM and dispatch."""
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize(
+        "m,n,k",
+        [
+            (256, 256, 256),   # EVEN (M%128==0, N%128==0, K%64==0)
+            (160, 320, 256),   # EVEN_K (K%64==0, odd M/N)
+            (150, 200, 176),   # general masked (odd M, N, K%16==0)
+        ],
+    )
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("has_bias", [False, True])
+    @pytest.mark.parametrize("per_channel_w", [True, False])
+    def test_triton_int8_gemm_dequant_matches_cutlass(
+        self, m, n, k, out_dtype, has_bias, per_channel_w, seed
+    ):
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        ws = (
+            torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+            if per_channel_w
+            else torch.rand(1, dtype=torch.float32, device="cuda") * 0.02
+        )
+        bias = (
+            torch.randn(n, dtype=out_dtype, device="cuda")
+            if has_bias
+            else cuda_backend._empty_cuda_tensor(x.device, out_dtype)
+        )
+
+        out_triton = torch.empty((m, n), dtype=out_dtype, device="cuda")
+        assert triton_int8_gemm_dequant(x, w, xs, ws, bias, out_triton)
+
+        ws_cutlass = ws if ws.numel() == n else ws.expand(n).contiguous()
+        out_cutlass = torch.empty((m, n), dtype=out_dtype, device="cuda")
+        wrap = cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.current_stream().cuda_stream
+        assert cuda_backend._C.cutlass_int8_dequant(
+            wrap(x),
+            wrap(w),
+            wrap(xs),
+            wrap(ws_cutlass),
+            wrap(bias),
+            wrap(out_cutlass),
+            DTYPE_TO_CODE[out_dtype],
+            stream,
+        )
+        assert torch.equal(out_triton, out_cutlass)
+
+    def test_tile_config_selection(self):
+        """Thin-M tiles are chosen only where GB10 measurements show a win."""
+        pytest.importorskip("triton")
+        from comfy_kitchen.backends.triton.quantization import _int8_tile_config
+
+        gb10 = (12, 1)
+        # weight fits in L2 (16 MB): thin tiles
+        assert _int8_tile_config(24, 4096, 4096, gb10)[:2] == (64, 64)
+        assert _int8_tile_config(64, 4096, 4096, gb10)[:2] == (64, 64)
+        assert _int8_tile_config(127, 4096, 4096, gb10)[:2] == (64, 64)
+        assert _int8_tile_config(128, 4096, 4096, gb10)[:2] == (64, 128)
+        assert _int8_tile_config(207, 4096, 4096, gb10)[:2] == (64, 128)
+        assert _int8_tile_config(208, 4096, 4096, gb10)[:2] == (128, 64)
+        assert _int8_tile_config(256, 4096, 4096, gb10)[:2] == (128, 64)
+
+        # large M, or a weight that no longer fits in L2: keep the default tile
+        assert _int8_tile_config(288, 4096, 4096, gb10)[:2] == (128, 128)
+        assert _int8_tile_config(4096, 4096, 4096, gb10)[:2] == (128, 128)
+        assert _int8_tile_config(64, 5120, 5120, gb10)[:2] == (128, 128)
+        assert _int8_tile_config(192, 10240, 4096, gb10)[:2] == (128, 128)
+
+        # other architectures (this backend also serves ROCm/XPU) keep the generic tile
+        for cap in [(9, 0), (8, 0), (-1, -1)]:
+            assert _int8_tile_config(64, 4096, 4096, cap)[:2] == (128, 128)
+
+        # BK/warps/stages follow the tile
+        assert _int8_tile_config(64, 4096, 4096, gb10)[2:] == (64, 8, 4, 4)
+        assert _int8_tile_config(192, 4096, 4096, gb10)[2:] == (64, 8, 4, 4)
+        assert _int8_tile_config(256, 4096, 4096, gb10)[2:] == (64, 8, 8, 4)
+        assert _int8_tile_config(4096, 4096, 4096, gb10)[2:] == (64, 8, 8, 4)
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m", [24, 32, 63, 64, 96, 112, 127, 128, 160, 192, 207, 208, 256, 287, 288])
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+    def test_thin_m_tiles_match_cutlass(self, m, out_dtype, seed):
+        """Every tile band must stay bit-identical to CUTLASS (n=256,k=256 = thin band)."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        n, k = 256, 256
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        bias = cuda_backend._empty_cuda_tensor(x.device, out_dtype)
+
+        out_triton = torch.empty((m, n), dtype=out_dtype, device="cuda")
+        assert triton_int8_gemm_dequant(x, w, xs, ws, bias, out_triton)
+
+        out_cutlass = torch.empty((m, n), dtype=out_dtype, device="cuda")
+        wrap = cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.current_stream().cuda_stream
+        assert cuda_backend._C.cutlass_int8_dequant(
+            wrap(x), wrap(w), wrap(xs), wrap(ws), wrap(bias), wrap(out_cutlass),
+            DTYPE_TO_CODE[out_dtype], stream,
+        )
+        assert torch.equal(out_triton, out_cutlass)
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize(
+        "m,n,k",
+        [
+            (1100, 320, 176),   # npm=9 > G=8: exercises gid>=1 and a masked K tail
+            (1664, 384, 320),   # npm=13: two groups, partial last group
+            (384, 256, 256),    # EVEN on the 128x128 tile (M%128, N%128, K%64 all 0)
+            (1024, 512, 512),   # EVEN on a thin-tile boundary
+        ],
+    )
+    def test_swizzle_and_even_paths_match_cutlass(self, m, n, k, seed):
+        """Grouped pid decomposition (gid>=1) and the fully unmasked path."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        got = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        ref = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+
+        assert triton_int8_gemm_dequant(x, w, xs, ws, bias, got)
+        wrap = cuda_backend._wrap_for_dlpack
+        assert cuda_backend._C.cutlass_int8_dequant(
+            wrap(x), wrap(w), wrap(xs), wrap(ws), wrap(bias), wrap(ref),
+            DTYPE_TO_CODE[torch.bfloat16], torch.cuda.current_stream().cuda_stream,
+        )
+        assert torch.equal(got, ref)
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m", [64, 192, 320])
+    def test_cuda_int8_linear_routes_match(self, m, monkeypatch, seed):
+        """End to end through the CUDA backend (quantise + GEMM) on both routes."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        n, k = 512, 512
+        x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "cutlass")
+        ref = cuda_backend.int8_linear(x, w, ws)
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        got = cuda_backend.int8_linear(x, w, ws)
+        assert torch.equal(got, ref)
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,expect_triton", [(16, False), (23, False), (24, True), (64, True), (127, True)])
+    def test_dispatch_gate_opens_below_128(self, m, expect_triton, monkeypatch, seed):
+        """M in [24,128) used to be routed to CUTLASS, which is 4.5x slower at M=64."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton import quantization as triton_quant
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+
+        calls = []
+
+        def spy(x8, w8, xs, ws, bias, out, **kwargs):
+            calls.append((tuple(x8.shape), tuple(w8.shape), sorted(kwargs)))
+            out.zero_()
+            return True
+
+        monkeypatch.setattr(triton_quant, "triton_int8_gemm_dequant", spy)
+
+        n, k = 256, 256
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.01
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.01
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        stream = torch.cuda.current_stream().cuda_stream
+
+        assert cuda_backend._cutlass_int8_dequant(
+            x, w, xs, ws, bias, out, DTYPE_TO_CODE[torch.bfloat16], stream
+        )
+        assert bool(calls) is expect_triton
+
+    def test_python_header_check_is_memoized(self, monkeypatch):
+        """The header guard used to cost ~52 us per launch; it must run once."""
+        import os
+
+        pytest.importorskip("triton")
+        from comfy_kitchen.backends.triton import quantization as triton_quant
+
+        monkeypatch.setenv("CPATH", "")  # restored by monkeypatch, not leaked to other tests
+        real_exists = os.path.exists
+        hits = []
+
+        def counting_exists(path):
+            hits.append(path)
+            return real_exists(path)
+
+        monkeypatch.setattr(triton_quant, "_PY_HEADERS_CHECKED", False)
+        monkeypatch.setattr(os.path, "exists", counting_exists)
+        triton_quant._ensure_python_headers()
+        first = len(hits)
+        triton_quant._ensure_python_headers()
+        triton_quant._ensure_python_headers()
+        assert len(hits) == first
+        assert triton_quant._PY_HEADERS_CHECKED is True
+
+    def test_sm121_dispatch_policy(self, monkeypatch):
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        monkeypatch.setattr(cuda_backend, "_INT8_MODE", "")
+        monkeypatch.delenv("COMFY_KITCHEN_INT8_MODE", raising=False)
+
+        monkeypatch.setattr(cuda_backend, "_cuda_device_capability", lambda idx: (12, 1))
+        assert cuda_backend._should_use_triton_int8_dequant(0) is True
+
+        monkeypatch.setattr(cuda_backend, "_cuda_device_capability", lambda idx: (12, 0))
+        assert cuda_backend._should_use_triton_int8_dequant(0) is False
+
+        monkeypatch.setattr(cuda_backend, "_cuda_device_capability", lambda idx: (9, 0))
+        assert cuda_backend._should_use_triton_int8_dequant(0) is False
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        assert cuda_backend._should_use_triton_int8_dequant(0) is True
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "off")
+        monkeypatch.setattr(cuda_backend, "_cuda_device_capability", lambda idx: (12, 1))
+        assert cuda_backend._should_use_triton_int8_dequant(0) is False
+
+    @requires_cuda_backend
+    def test_cutlass_int8_dequant_fail_open_fallback(self, monkeypatch, seed):
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton import quantization as triton_quant
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated Triton failure")
+
+        monkeypatch.setattr(triton_quant, "triton_int8_gemm_dequant", boom)
+
+        m, n, k = 128, 128, 128
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.01
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.01
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        stream = torch.cuda.current_stream().cuda_stream
+
+        assert cuda_backend._cutlass_int8_dequant(
+            x, w, xs, ws, bias, out, DTYPE_TO_CODE[torch.bfloat16], stream
+        )
+        assert cuda_backend._triton_int8_broken is True
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,n,k", [
+        (24, 1, 256), (24, 7, 256), (24, 33, 256),   # N unaligned: CUTLASS is *wrong* here
+        (24, 64, 16), (24, 64, 32), (24, 64, 48),    # K < BK
+        (300, 7, 64), (320, 129, 96),
+    ])
+    def test_edge_shapes_match_exact_reference(self, m, n, k, seed):
+        """Unaligned N / K < BK must match an exact int reference, not CUTLASS.
+
+        N % 16 != 0 makes the upstream CUTLASS kernel emit garbage (measured: 5.3e6
+        absolute error at N=7, NaN at N=33), so the reference here is the exact
+        float32 matmul of int8 values (|sum| <= 127*127*K, exact in fp32 for small K)
+        followed by the same epilogue order.
+        """
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        x = torch.randint(-128, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+
+        got = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        assert triton_int8_gemm_dequant(x, w, xs, ws, bias, got)
+
+        acc = x.to(torch.float32) @ w.to(torch.float32).T
+        ref = ((acc * xs) * ws).to(torch.bfloat16)
+        assert torch.equal(got, ref)
+
+    @requires_cuda_backend
+    def test_non_contiguous_scales_never_reach_triton(self, monkeypatch, seed):
+        """expand()/strided scales must fall back: the kernel reads stride-1 floats."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+
+        m, n, k = 64, 128, 256
+        x = torch.randint(-128, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        stream = torch.cuda.current_stream().cuda_stream
+
+        expanded = torch.tensor([0.01], device="cuda").expand(n)   # numel == n, stride 0
+        assert not expanded.is_contiguous()
+        out_exp = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        out_con = torch.empty_like(out_exp)
+        assert cuda_backend._cutlass_int8_dequant(
+            x, w, xs, expanded, bias, out_exp, DTYPE_TO_CODE[torch.bfloat16], stream
+        )
+        assert cuda_backend._cutlass_int8_dequant(
+            x, w, xs, expanded.contiguous(), bias, out_con, DTYPE_TO_CODE[torch.bfloat16], stream
+        )
+        assert torch.equal(out_exp, out_con)
+
+    @requires_cuda_backend
+    def test_two_dim_weight_scale_falls_back(self, monkeypatch, seed):
+        """A (1, 1) weight_scale must not crash the CUTLASS fallback (upstream did)."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "cutlass")
+        m, n, k = 16, 64, 256          # m < _TRITON_INT8_MIN_M: pure CUTLASS path
+        x = torch.randint(-128, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        assert cuda_backend._cutlass_int8_dequant(
+            x, w, xs, torch.tensor([[0.01]], device="cuda"), bias, out,
+            DTYPE_TO_CODE[torch.bfloat16], torch.cuda.current_stream().cuda_stream,
+        )
+        assert torch.isfinite(out.float()).all()
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (1024, 512, 256), (384, 320, 176), (150, 200, 176)])
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("has_bias", [False, True])
+    @pytest.mark.parametrize("scalar_ws,scalar_rs", [(False, False), (True, True)])
+    def test_residual_epilogue_matches_cutlass(
+        self, m, n, k, out_dtype, has_bias, scalar_ws, scalar_rs, seed
+    ):
+        """out = residual + rscale * round_out(acc*xs*ws + bias), bit for bit."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, dtype=torch.float32, device="cuda") * 0.02
+        ws = (
+            torch.rand(1, dtype=torch.float32, device="cuda") * 0.02
+            if scalar_ws
+            else torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        )
+        bias = (
+            torch.randn(n, dtype=out_dtype, device="cuda")
+            if has_bias
+            else cuda_backend._empty_cuda_tensor(x.device, out_dtype)
+        )
+        resid = (torch.randn(m, n, device="cuda") * 0.5).to(out_dtype)
+        rs_full = (torch.rand(n, device="cuda") * 0.2 + 0.9).to(out_dtype)
+        rs = rs_full[:1] if scalar_rs else rs_full
+
+        got = torch.empty((m, n), dtype=out_dtype, device="cuda")
+        assert triton_int8_gemm_dequant(
+            x, w, xs, ws, bias, got, residual=resid, residual_scale=rs
+        )
+        ref = torch.empty_like(got)
+        assert cuda_backend._C.cutlass_int8_dequant_residual(
+            cuda_backend._wrap_for_dlpack(x),
+            cuda_backend._wrap_for_dlpack(w),
+            cuda_backend._wrap_for_dlpack(xs),
+            cuda_backend._wrap_for_dlpack(ws if ws.numel() == n else ws.expand(n).contiguous()),
+            cuda_backend._wrap_for_dlpack(bias),
+            cuda_backend._wrap_for_dlpack(rs if rs.numel() == n else rs.expand(n).contiguous()),
+            cuda_backend._wrap_for_dlpack(resid),
+            cuda_backend._wrap_for_dlpack(ref),
+            DTYPE_TO_CODE[out_dtype],
+            torch.cuda.current_stream().cuda_stream,
+        )
+        assert torch.equal(got, ref)
+
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m", [64, 192, 512])
+    def test_residual_routes_match_end_to_end(self, m, monkeypatch, seed):
+        """ck.int8_linear(residual=...) is identical on the CUTLASS and Triton routes."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        n, k = 512, 512
+        x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        resid = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+        rs = (torch.rand(n, device="cuda") * 0.3 + 0.8).to(torch.bfloat16)
+        from comfy_kitchen.backends.triton import quantization as triton_quant
+
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+        calls = []
+        real = triton_quant.triton_int8_gemm_dequant
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("residual") is not None)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(triton_quant, "triton_int8_gemm_dequant", spy)
+
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "cutlass")
+        ref = cuda_backend.int8_linear(x, w, ws, residual=resid, residual_scale=rs)
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+        got = cuda_backend.int8_linear(x, w, ws, residual=resid, residual_scale=rs)
+        assert torch.equal(got, ref)
+        # otherwise both sides could have taken CUTLASS and the equality is trivial
+        assert calls and all(calls), "the fused Triton residual path must actually run"
+
+    @requires_cuda_backend
+    def test_residual_negative_zero_matches_cutlass(self, seed):
+        """CUTLASS's bias visitor adds +0.0, so a -0.0 product must not keep its sign."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+        from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+        m, n, k = 64, 128, 256
+        x = torch.zeros((m, k), dtype=torch.int8, device="cuda")          # acc == 0
+        w = torch.ones((n, k), dtype=torch.int8, device="cuda")
+        xs = torch.full((m, 1), -0.5, dtype=torch.float32, device="cuda")  # 0 * -0.5 = -0.0
+        ws = torch.ones(n, dtype=torch.float32, device="cuda")
+        bias = cuda_backend._empty_cuda_tensor(x.device, torch.bfloat16)
+        resid = torch.full((m, n), -0.0, dtype=torch.bfloat16, device="cuda")
+        rs = torch.full((n,), 0.5, dtype=torch.bfloat16, device="cuda")
+
+        got = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        assert triton_int8_gemm_dequant(x, w, xs, ws, bias, got, residual=resid, residual_scale=rs)
+        ref = torch.empty_like(got)
+        assert cuda_backend._C.cutlass_int8_dequant_residual(
+            cuda_backend._wrap_for_dlpack(x), cuda_backend._wrap_for_dlpack(w),
+            cuda_backend._wrap_for_dlpack(xs), cuda_backend._wrap_for_dlpack(ws),
+            cuda_backend._wrap_for_dlpack(bias), cuda_backend._wrap_for_dlpack(rs),
+            cuda_backend._wrap_for_dlpack(resid), cuda_backend._wrap_for_dlpack(ref),
+            DTYPE_TO_CODE[torch.bfloat16], torch.cuda.current_stream().cuda_stream,
+        )
+        assert torch.equal(got, ref)
+
+    @requires_cuda_backend
+    def test_cpu_residual_scale_does_not_poison_triton(self, monkeypatch, seed):
+        """A CPU scale must be rejected by the gate, not raise inside Triton and latch."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        monkeypatch.setattr(cuda_backend, "_triton_int8_broken", False)
+        monkeypatch.setenv("COMFY_KITCHEN_INT8_MODE", "triton")
+
+        m, n, k = 128, 512, 512
+        x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        ws = torch.rand(n, dtype=torch.float32, device="cuda") * 0.02
+        resid = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+        rs_cpu = (torch.rand(n) * 0.3 + 0.8).to(torch.bfloat16)
+
+        out = cuda_backend.int8_linear(x, w, ws, residual=resid, residual_scale=rs_cpu)
+        assert cuda_backend._triton_int8_broken is False
+        ref = cuda_backend.int8_linear(x, w, ws, residual=resid, residual_scale=rs_cpu.cuda())
+        assert torch.equal(out, ref)

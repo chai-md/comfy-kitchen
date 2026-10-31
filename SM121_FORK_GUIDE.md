@@ -1,0 +1,776 @@
+# GB10 (`sm_121`) 向け `comfy-kitchen` フォーク指示書
+
+上流 `Comfy-Org/comfy-kitchen` をフォークし、**GB10 (sm_121) 用の INT8 GEMM 最適化を再適用**するための手順書です。上流の新リリースに追従するたびに、この文書の §3→§5 を繰り返せば同じ状態に戻せます。
+
+- 対象機: dgxspark1（GB10 / 48 SM / 2190 MHz、クロック上限 2200）
+- 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、Python venv = `/home/chai/ComfyUI/.venv`
+- ベース: `comfy-kitchen` v0.2.40、コミット `cdab478`
+- 変更は **Python のみ**（CUDA/C++ の変更なし。`_C.abi3.so` は再ビルドで作り直すが、差分は無い）
+
+---
+
+## 0. 何が速くなるか（先に期待値を合わせる）
+
+| 領域 | 効果 | 条件 |
+| :--- | ---: | :--- |
+| 大形状（M ≥ 288） | **170〜177 TOPS**（変更前から同じ） | 既に機械の実用天井。ここは伸びない |
+| 細い M（24〜287） | **1.1〜1.7 倍** | 重みが L2 に載る（`N*K ≤ 20M` 要素）とき |
+| M < 24 | 変化なし（CUTLASS のまま） | M ≤ 16 は CUTLASS が速い |
+| CPU 固定費 | 66.4 → 13.3 µs/呼び出し | 全形状 |
+| 重みが L2 を超える形状（例 5120×5120） | ±3〜4%（誤差） | 帯域律速のため |
+
+---
+
+## 1. フォークとブランチ
+
+```bash
+# gh CLI を使う場合（フォーク作成 + clone を一度に）
+gh repo fork Comfy-Org/comfy-kitchen --clone
+cd comfy-kitchen
+
+# 手動の場合
+#   GitHub で Fork → git clone git@github.com:<you>/comfy-kitchen.git
+#   git remote add upstream https://github.com/Comfy-Org/comfy-kitchen.git
+
+git checkout -b gb10-sm121-int8 cdab478     # v0.2.40 のベースコミット
+git submodule update --init --depth 1        # 必須（§4 の罠を参照）
+```
+
+コミットは 3 つに割ると追従が楽です。
+
+1. `triton: fused-dequant INT8 GEMM for sm_121` — カーネル + ランチャー + タイル表
+2. `cuda: dispatch sm_121 INT8 GEMM to Triton with fail-open fallback` — ディスパッチ + 呼び出し置換 + `MIN_M`
+3. `tests: cover sm_121 INT8 dispatch, tile bands and bit-identity`
+
+---
+
+## 2. 変更対象ファイル
+
+| ファイル | 変更 |
+| :--- | :--- |
+| `comfy_kitchen/backends/triton/quantization.py` | 融合カーネル、タイル選択 `_int8_tile_config()`、`_ensure_python_headers()` のメモ化、`int8_linear()` を新カーネルへ |
+| `comfy_kitchen/backends/cuda/__init__.py` | モード読取（env / ファイル）、`_should_use_triton_int8_dequant()`、`_cutlass_int8_dequant()` ラッパー、3 箇所の呼び出し置換、`_TRITON_INT8_MIN_M = 24` |
+| `comfy_kitchen/__init__.py` | `int8_linear()` に `torch.compiler.is_compiling()` の早期リターン |
+| `tests/test_int8.py` | `TestTritonInt8GemmDequant`（7 メソッド） |
+
+---
+
+## 3. 変更内容（完全版）
+
+### 3.1 `comfy_kitchen/backends/triton/quantization.py`
+
+**旧 `_int8_matmul_dequant_kernel` / `_int8_matmul_dequant_per_row_kernel` は削除**し、以下を置きます。`int8_linear()` は `triton_int8_gemm_dequant()` を呼ぶように変更します。
+
+```python
+_PY_HEADERS_FALLBACK = "/opt/py312-include"
+_PY_HEADERS_CHECKED = False
+
+
+def _ensure_python_headers() -> None:
+    """Make Python.h reachable for Triton's runtime C compile (once per process).
+
+    The check itself costs ~52 us (sysconfig + stat) and used to run on every
+    launch, which is a measurable share of a thin-M GEMM.
+    """
+    global _PY_HEADERS_CHECKED
+    if _PY_HEADERS_CHECKED:
+        return
+    import os
+    import sys
+    import sysconfig
+
+    inc = sysconfig.get_paths().get("include", "")
+    if not os.path.exists(os.path.join(inc, "Python.h")):
+        # Only a same-major.minor include dir is safe here: Triton's runtime driver
+        # compiles against version-specific PyObject internals, so borrowing another
+        # version's headers can corrupt the interpreter.
+        alt = os.path.join(_PY_HEADERS_FALLBACK, f"python{sys.version_info.major}.{sys.version_info.minor}")
+        if os.path.exists(os.path.join(alt, "Python.h")):
+            os.environ["CPATH"] = os.pathsep.join(
+                p for p in (alt, os.environ.get("CPATH")) if p
+            )
+    _PY_HEADERS_CHECKED = True
+
+
+@triton.jit
+def _int8_gemm_dequant_kernel(
+    a,
+    b,
+    xs,
+    ws,
+    bias,
+    c,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    sbn,
+    sbk,
+    scm,
+    scn,
+    ws_n,
+    HAS_BIAS: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
+    EVEN: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    """Fused INT8 GEMM + dequantization epilogue:
+    C[m, n] = (sum_k A[m, k] * B[n, k]) * xs[m] * ws[n] + bias[n]
+    """
+    pid = tl.program_id(0)
+    npm = tl.cdiv(M, BM)
+    npn = tl.cdiv(N, BN)
+    gid = pid // (G * npn)
+    fm = gid * G
+    gs = min(npm - fm, G)
+    pm = fm + (pid % gs)
+    pn = (pid % (G * npn)) // gs
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    # int64 offsets: M*N or M*K past 2^31 elements (CFG batches, long clips) would wrap in int32
+    rm64 = rm.to(tl.int64)
+    rn64 = rn.to(tl.int64)
+    A = a + rm64[:, None] * sam + rk[None, :] * sak
+    B = b + rn64[None, :] * sbn + rk[:, None] * sbk
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for k0 in range(0, K, BK):
+        if EVEN:  # M, N, K are tile multiples: unmasked loads
+            acc += tl.dot(tl.load(A), tl.load(B))
+        elif EVEN_K:  # only K is a tile multiple: row/column masks only
+            acc += tl.dot(
+                tl.load(A, mask=rm[:, None] < M, other=0),
+                tl.load(B, mask=rn[None, :] < N, other=0),
+            )
+        else:
+            km = (k0 + rk) < K
+            acc += tl.dot(
+                tl.load(A, mask=(rm[:, None] < M) & km[None, :], other=0),
+                tl.load(B, mask=(rn[None, :] < N) & km[:, None], other=0),
+            )
+        A += BK * sak
+        B += BK * sbk
+    out = acc.to(tl.float32) * tl.load(xs + rm, mask=rm < M, other=0.0)[:, None]
+    out = out * tl.load(ws + rn * ws_n, mask=rn < N, other=0.0)[None, :]
+    if HAS_BIAS:
+        out += tl.load(bias + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+    C = c + rm64[:, None] * scm + rn64[None, :] * scn
+    tl.store(C, out.to(c.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+# While the int8 weight fits in L2 it is re-read from cache once per M-tile, so the
+# tile shape decides throughput; past that point the kernel is bandwidth-bound on B
+# and splitting M only adds masked tail work. Measured on GB10: 4096x4096 (=16 MB)
+# gains up to 2x from thin tiles, 5120x5120 (=26 MB) and 10240x4096 (=41 MB) stay
+# flat within 4%.
+_INT8_L2_WEIGHT_ELEMS = 20 << 20
+_INT8_GB10_DEFAULT_TILE = (128, 128, 64, 8, 8, 4)
+# 64 KB shared-memory devices (sm_75, RDNA1-4): 4 stages x (128*64 + 64*128) bytes
+# is exactly 64 KB and fails to compile. Halving BK keeps the CTA shape at 32 KB.
+_INT8_PORTABLE_TILE = (128, 128, 32, 8, 8, 4)
+_DEVICE_CAPABILITY: dict[int, tuple[int, int]] = {}
+
+
+def _device_capability(device_index: int = 0) -> tuple[int, int]:
+    """Cached (major, minor) for the device, or (-1, -1) when it cannot be queried."""
+    cap = _DEVICE_CAPABILITY.get(device_index)
+    if cap is None:
+        try:
+            props = torch.cuda.get_device_properties(device_index)
+            cap = (int(props.major), int(props.minor))
+        except Exception:  # ROCm/XPU/CPU: no CUDA properties
+            cap = (-1, -1)
+        _DEVICE_CAPABILITY[device_index] = cap
+    return cap
+
+
+def _int8_tile_config(
+    m: int, n: int, k: int, capability: tuple[int, int] | None = None
+) -> tuple[int, int, int, int, int, int]:
+    """Pick (BM, BN, BK, G, num_warps, num_stages) for this GEMM shape.
+
+    GB10 (sm_121) has 48 SMs. The 128x128 tile needs M to be a multiple of 128;
+    otherwise the last M-tile is partly empty and the CTA count stops matching the
+    SM count (M=160 -> 2x32 = 64 CTAs = 1.33 waves, measured 1.6x slower than a
+    64-row tile). Tile choice never changes the result: the int32 accumulation is
+    exact and the dequant epilogue runs per output element, so every band below is
+    bit-identical to the 128x128 kernel.
+
+    Band boundaries are min-of-N measurements on GB10 (n=k=4096; the weight fits in
+    L2 there, which is the regime where the tile matters at all). Other devices keep
+    the generic tile: this Triton backend also serves ROCm/XPU, where the GB10 bands
+    are unmeasured.
+    """
+    if capability is None:
+        capability = _device_capability()
+    if capability != (12, 1):
+        return _INT8_PORTABLE_TILE
+    if m >= 288 or n * k > _INT8_L2_WEIGHT_ELEMS:
+        return _INT8_GB10_DEFAULT_TILE  # the shape-tuned default
+    if m >= 208:
+        return 128, 64, 64, 8, 8, 4   # 208-287: beats 128x128 by ~1.15x
+    if m >= 128:
+        return 64, 128, 64, 8, 4, 4   # 128-207: 1.6x
+    return 64, 64, 64, 8, 4, 4        # <128: 1.6-1.7x
+
+
+def triton_int8_gemm_dequant(
+    x8: torch.Tensor,
+    w8: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+) -> bool:
+    """Launch fused INT8 GEMM + dequantization epilogue in Triton.
+
+    Applies the same float operations in the same order as CUTLASS
+    ``cutlass_int8_dequant``: ``(int32 -> fp32 * x_scale * w_scale + bias) -> out.dtype``.
+    """
+    _ensure_python_headers()
+    M, K = x8.shape
+    N = w8.shape[0]
+    if M == 0 or N == 0:
+        return True
+    if K == 0:
+        if bias is not None and bias.numel() > 0:
+            out.copy_(bias.reshape(1, N).expand(M, N))
+        else:
+            out.zero_()
+        return True
+    xs = x_scale.reshape(-1).contiguous()
+    ws = w_scale.reshape(-1).contiguous()
+    ws_n = 0 if ws.numel() == 1 else 1
+    # The kernel reads these as flat, stride-1 vectors: materialise them rather than
+    # trusting a direct caller (expand()/slices produce numel == n with stride 0).
+    if bias is not None and bias.numel() > 0:
+        has_bias = True
+        bias_arg = bias.reshape(-1).contiguous()
+    else:
+        has_bias = False
+        bias_arg = out
+    BM, BN, BK, G, num_warps, num_stages = _int8_tile_config(M, N, K)
+    # Unmasked K loop when every dim (or K) is a tile multiple.
+    even_k = K % BK == 0
+    even = even_k and M % BM == 0 and N % BN == 0
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+    _int8_gemm_dequant_kernel[grid](
+        x8,
+        w8,
+        xs,
+        ws,
+        bias_arg,
+        out,
+        M,
+        N,
+        K,
+        x8.stride(0),
+        x8.stride(1),
+        w8.stride(0),
+        w8.stride(1),
+        out.stride(0),
+        out.stride(1),
+        ws_n,
+        HAS_BIAS=has_bias,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        G=G,
+        EVEN=even,
+        EVEN_K=even_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return True
+```
+
+**残差融合（`residual` あり）の追加分** — カーネル引数に `resid`, `rs`, `rs_n`, `HAS_RESIDUAL` を足し、epilogue を以下に置き換えます。
+
+```python
+    out_ty = c.dtype.element_ty
+    if HAS_RESIDUAL:
+        # Add2 rounds to the output dtype even when bias is absent (CUTLASS always
+        # runs the Bias visitor, with a zero default), then Mul3 + Add4 run in fp32.
+        out = out.to(out_ty).to(tl.float32)
+        out = out * tl.load(rs + rn * rs_n, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+        out = out + tl.load(
+            resid + rm64[:, None] * scm + rn64[None, :] * scn,
+            mask=(rm[:, None] < M) & (rn[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+    tl.store(C, out.to(out_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
+```
+
+ランチャー側は `triton_int8_gemm_dequant(..., residual=..., residual_scale=...)` を受け、`residual is None` のときはダミーポインタ（`out`）を渡して `HAS_RESIDUAL=False` にします。ディスパッチ側は `_cutlass_int8_dequant(..., residual=, residual_scale=)` に統合し、Triton が使えないときだけ `_C.cutlass_int8_dequant_residual` に落とします。
+
+> **再発しやすい罠**: ランチャーの `BM=BN=BK=G=num_warps=num_stages` は必ず変数で渡すこと。ここを定数のまま残すと、グリッドだけタイル選択に従って**結果が壊れます**（§5 の bit-identical 検査で即座に検出できます）。
+
+### 3.2 `comfy_kitchen/backends/cuda/__init__.py`
+
+**(a) 定数とモード読取**（`_CONVROT_FUSED_MAX_K = 16384` の直後）
+
+```python
+_INT8_MODE_FILE = os.environ.get("COMFY_KITCHEN_INT8_MODE_FILE", "/etc/comfy-kitchen-int8.mode")
+# Below this M the CUTLASS kernel wins (measured on GB10: 14.8-24.5 us for M<=16
+# vs 23-28 us for Triton); at M>=24 Triton is ahead and at M=64 it is 4.5x ahead
+# (25.7 us vs 116.8 us), so the gate used to send the worst part of the range to
+# the slower kernel.
+_TRITON_INT8_MIN_M = 24
+_triton_int8_broken = False
+
+
+def _read_int8_mode() -> str:
+    env_mode = os.environ.get("COMFY_KITCHEN_INT8_MODE", "").strip().lower()
+    if env_mode:
+        return env_mode
+    try:
+        with open(_INT8_MODE_FILE, encoding="utf-8", errors="replace") as f:
+            return f.read().strip().lower()
+    except (OSError, ValueError):
+        # A missing file is the normal case; an unreadable or undecodable one must
+        # not break `import comfy_kitchen`.
+        return ""
+
+
+_INT8_MODE = _read_int8_mode()
+
+_DISABLE_CUTLASS_INT8 = (
+    os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
+    or _INT8_MODE == "cublas"
+)
+
+
+def _should_use_triton_int8_dequant(device_index: int) -> bool:
+    mode = os.environ.get("COMFY_KITCHEN_INT8_MODE", "").strip().lower() or _INT8_MODE
+    if mode in ("off", "cutlass", "cublas", "0", "false"):
+        return False
+    if mode == "triton":
+        return True
+    # On NVIDIA GB10 (sm_121), the SM80-targeted CUTLASS INT8 kernel reaches
+    # only ~37% of peak TOPS on large-M shapes, whereas the tuned Triton
+    # fused-dequant INT8 GEMM reaches ~88% of peak while staying bit-identical.
+    return _cuda_device_capability(device_index) == (12, 1)
+```
+
+**(b) ディスパッチ用ラッパー**
+
+```python
+def _cutlass_int8_dequant(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    output_dtype_code: int,
+    stream_ptr: int,
+) -> bool:
+    global _triton_int8_broken
+    m, k = x.shape
+    n = w.shape[0]
+    # The Triton kernel launches on PyTorch's current device and stream, not on
+    # (x.device, stream_ptr). Both checks keep a mismatched caller on CUTLASS
+    # instead of launching against the wrong GPU or racing the producer. They sit
+    # at the end of the gate so the short-circuit keeps the cheap path cheap.
+    if (
+        not _triton_int8_broken
+        and m >= _TRITON_INT8_MIN_M
+        and k % 16 == 0
+        and k < 131072  # int32 accumulator: 127*127*131072 still fits; satfinite vs wrap diverges past it
+        and w.dim() == 2
+        and w.shape[1] == k
+        and x.dtype == torch.int8
+        and w.dtype == torch.int8
+        and x.is_contiguous()
+        and w.is_contiguous()
+        and out.is_contiguous()
+        and out.shape == (m, n)
+        and out.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and x_scale.dtype == torch.float32
+        and x_scale.numel() == m
+        and x_scale.is_contiguous()
+        and w_scale.dtype == torch.float32
+        and w_scale.numel() in (1, n)
+        and w_scale.is_contiguous()
+        and (
+            bias.numel() == 0
+            or (bias.numel() == n and bias.dtype == out.dtype and bias.is_contiguous())
+        )
+        and x.get_device() == torch.cuda.current_device()
+        and stream_ptr == torch.cuda.current_stream().cuda_stream
+        and _should_use_triton_int8_dequant(x.get_device())
+    ):
+        try:
+            from comfy_kitchen.backends.triton.quantization import (
+                triton_int8_gemm_dequant,
+            )
+
+            return triton_int8_gemm_dequant(x, w, x_scale, w_scale, bias, out)
+        except Exception as e:
+            _triton_int8_broken = True
+            print(
+                f"[comfy_kitchen] Triton INT8 GEMM failed ({type(e).__name__}: {e}); "
+                f"falling back to CUTLASS for remainder of session",
+                file=sys.stderr,
+            )
+
+    ws_cutlass = (
+        w_scale.reshape(-1).contiguous()
+        if w_scale.numel() == n
+        else w_scale.reshape(-1)[:1].expand(n).contiguous()
+    )
+    return _C.cutlass_int8_dequant(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(w),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(ws_cutlass),
+        _wrap_for_dlpack(bias),
+        _wrap_for_dlpack(out),
+        output_dtype_code,
+        stream_ptr,
+    )
+```
+
+**(c) 呼び出し置換（3 箇所）** — 残差なしパスの `_C.cutlass_int8_dequant(...)` を `_cutlass_int8_dequant(...)` に置き換えます。
+
+- `_int4_linear_via_int8_values()` 内
+- `int8_linear()` 内（`if not used_cutlass:` のブロック）
+- `w4a8_int8_linear()` 内
+
+これで **int8 / int4(w4a8) / w4a8 の全経路**が同じカーネルを使います。
+
+### 3.3 `comfy_kitchen/__init__.py`
+
+`int8_linear()` の `if out_dtype is None: out_dtype = torch.bfloat16` の直後：
+
+```python
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    # The custom op has no autograd formula and its meta function ignores residual
+    # broadcasting, so only the plain inference call takes the fast path under
+    # torch.compile; anything else keeps tracing the Python implementation.
+    if torch.compiler.is_compiling() and residual is None and not any(
+        getattr(t, "requires_grad", False)
+        for t in (x, weight, bias, input_act_weight, residual_scale)
+    ):
+        if not isinstance(weight_scale, torch.Tensor):
+            weight_scale = torch.tensor(weight_scale, device=x.device, dtype=torch.float32)
+        return torch.ops.comfy_kitchen.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            DTYPE_TO_CODE[out_dtype],
+            convrot,
+            convrot_groupsize,
+            input_act,
+            input_act_weight,
+            input_act_eps,
+            residual,
+            residual_scale,
+        )
+```
+
+### 3.4 `tests/test_int8.py`
+
+末尾に `TestTritonInt8GemmDequant` を追加（7 メソッド）。合格条件は以下。
+
+| テスト | 内容 |
+| :--- | :--- |
+| `test_triton_int8_gemm_dequant_matches_cutlass` | 3 形状 × dtype3 × bias2 × per-channel2 で CUTLASS と `torch.equal` |
+| `test_tile_config_selection` | 帯域境界（24/127/128/207/208/256/288）、L2 ゲート、非 GB10 は既定タイル |
+| `test_thin_m_tiles_match_cutlass` | M=24〜288 の 15 点で帯域ごとのビット一致 |
+| `test_swizzle_and_even_paths_match_cutlass` | `gid>=1` のグループ分解（M=1100/1664）と EVEN 全開パス（384/1024） |
+| `test_cuda_int8_linear_routes_match` | CUDA バックエンド経由（量子化＋GEMM）で cutlass と triton が一致 |
+| `test_dispatch_gate_opens_below_128` | M=16/23 は CUTLASS、24/64/127 は Triton（スパイで検証） |
+| `test_python_header_check_is_memoized` | ガードが 1 回しか stat しない（CPATH は monkeypatch で復元） |
+| `test_sm121_dispatch_policy` | cap `(12,1)` 判定と env モード |
+| `test_cutlass_int8_dequant_fail_open_fallback` | 例外時に CUTLASS へ落ち `_triton_int8_broken` が立つ |
+| `test_edge_shapes_match_exact_reference` | N=1/7/33（不揃え）と K<BK。CUTLASS ではなく厳密参照と比較（§10.4） |
+| `test_non_contiguous_scales_never_reach_triton` | `expand(n)` スケールは CUTLASS に落ち、連続版と同値 |
+| `test_two_dim_weight_scale_falls_back` | `(1,1)` の weight_scale でクラッシュしない |
+| `test_residual_epilogue_matches_cutlass` | 残差融合 epilogue が CUTLASS と `torch.equal`（4形状×dtype3×bias2） |
+| `test_residual_routes_match_end_to_end` | `ck.int8_linear(residual=...)` の cutlass/triton 経路一致（スパイで Triton 実走を確認） |
+| `test_residual_negative_zero_matches_cutlass` | bias 無しの `-0.0` 符号（CUTLASS は `+0.0` にする） |
+| `test_cpu_residual_scale_does_not_poison_triton` | CPU スケールでゲートが落ち、`_triton_int8_broken` が立たない |
+
+> 実装はリポジトリの `tests/test_int8.py` をそのまま参照（この文書の付録ではなくコードを正とする）。
+
+---
+
+## 4. ビルドとインストール
+
+### 4.1 サブモジュール（最重要）
+
+```bash
+cd ~/comfy-kitchen
+git submodule update --init --depth 1
+```
+
+空のままビルドすると 2 つの事故が起きます。
+
+1. `flash_decode.cu` が `flash_attn` ヘッダを見つけられずビルドが途中で失敗する
+2. CMake が `COMFY_HAVE_CUTLASS` を無効化し、`cutlass_gemm_int8.cu` 等が **4KB のダミースタブ**としてコンパイルされる →「ビルドは成功するが遅い」という最悪の失敗
+
+初期化前に一度ビルドしていた場合は `rm -rf build` で CMake キャッシュを捨ててください。
+
+### 4.2 ビルド
+
+```bash
+source /home/chai/ComfyUI/.venv/bin/activate
+uv pip install nanobind packaging wheel cmake ninja   # 不足時のみ
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e /home/chai/comfy-kitchen
+```
+
+- `COMFY_CUDA_ARCHS=121` で旧世代 arch のコンパイルを省略（20 コアで 2〜3 分）
+- `-e`（editable）なので `_C.abi3.so` はリポジトリ直下に置かれ、以後 **Python の修正は再ビルド不要**
+- 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら 4.1 の罠）
+
+---
+
+## 5. 検証（変更したら必ず全部）
+
+### 5.1 ディスパッチとビット一致
+
+```bash
+/home/chai/ComfyUI/.venv/bin/python -c "
+import torch, comfy_kitchen
+from comfy_kitchen.backends import cuda as cb
+from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+from comfy_kitchen.backends.triton.quantization import triton_int8_gemm_dequant
+
+print('cap', cb._cuda_device_capability(0), 'dispatch', cb._should_use_triton_int8_dequant(0))
+assert cb._should_use_triton_int8_dequant(0) is True
+
+for m in (24, 64, 96, 160, 192, 256, 512):
+    n, k = 256, 256
+    x = torch.randint(-127, 128, (m, k), dtype=torch.int8, device='cuda')
+    w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device='cuda')
+    xs = torch.rand(m, 1, dtype=torch.float32, device='cuda') * 0.02
+    ws = torch.rand(n, dtype=torch.float32, device='cuda') * 0.02
+    bias = cb._empty_cuda_tensor(x.device, torch.bfloat16)
+    a = torch.empty((m, n), dtype=torch.bfloat16, device='cuda')
+    b = torch.empty((m, n), dtype=torch.bfloat16, device='cuda')
+    assert triton_int8_gemm_dequant(x, w, xs, ws, bias, a)
+    assert cb._C.cutlass_int8_dequant(cb._wrap_for_dlpack(x), cb._wrap_for_dlpack(w),
+        cb._wrap_for_dlpack(xs), cb._wrap_for_dlpack(ws), cb._wrap_for_dlpack(bias),
+        cb._wrap_for_dlpack(b), DTYPE_TO_CODE[torch.bfloat16],
+        torch.cuda.current_stream().cuda_stream)
+    assert torch.equal(a, b), f'M={m} mismatch'
+    print('M', m, 'bit-identical OK')
+"
+```
+
+### 5.2 タイル表
+
+```bash
+/home/chai/ComfyUI/.venv/bin/python -c "
+from comfy_kitchen.backends.triton.quantization import _int8_tile_config as f
+for m in (24, 64, 127, 128, 207, 208, 287, 288, 4096):
+    print(m, f(m, 4096, 4096)[:2], '|', m, f(m, 5120, 5120)[:2])
+"
+```
+
+期待値: `24..127 → (64,64)` / `128..207 → (64,128)` / `208..287 → (128,64)` / `288.. → (128,128)`、`5120×5120` は全て `(128,128)`。
+
+### 5.3 単体テスト
+
+```bash
+uv pip install --python /home/chai/ComfyUI/.venv/bin/python pytest   # 未導入なら
+/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py -q
+```
+
+期待値: 全件パス（本リポジトリでは `193 passed`。上流のテスト数 + 追加 75 ケース）。
+
+### 5.4 実測（任意だが推奨）
+
+**測定の作法**: 同一構成でも実行間で **10〜15% 揺れる**（クロック）。必ず min-of-3〜5、可能なら構成をラウンドロビンで回して比較する。10% 未満の差は有意とみなさない。
+
+---
+
+## 6. 上流追従
+
+```bash
+git fetch upstream
+git rebase upstream/main          # または upstream/master
+git submodule update --init --depth 1
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py -q
+```
+
+- コンフリクトしやすいのは **(1) `_cutlass_int8_dequant()` の 3 呼び出し箇所**、**(2) triton 側 `int8_linear()` の末尾**、**(3) `__init__.py` の `int8_linear()` 冒頭**。
+- 上流が同等機能（sm_121 判定や融合カーネル）を入れた場合は、**自分のゲートを捨てて上流に従う**。二重ディスパッチは事故のもと。
+- 追従後は §5 を必ず再実行（特に 5.1 のビット一致。上流が epilogue の演算順序を変えたら一致しなくなる）。
+- フォークを ComfyUI から使う場合、`pip install` の向き先が fork の URL/パスであることを確認（`direct_url.json`）。
+
+---
+
+## 7. やってはいけない最適化（実測済みの結論）
+
+| 案 | 判定 | 根拠 |
+| :--- | :--- | :--- |
+| tcgen05（第5世代TC）への書き直し | **やらない** | Triton 3.9 は sm_121 の INT8 を tcgen05 に lowering しない（TMA 記述子版でも `mma.sync.m16n8k32`）。cuBLAS の最速経路（FP8）が 178 TOPS ＝ 本カーネル 176.5 と同等で、上積みは最大2割・実質数% |
+| FP8 へ切り替え | **やらない** | レガシー経路では INT8 と同レート（105.6 vs 105.3 TOPS）。ビット一致も失う |
+| 活性量子化パスの融合 | **やらない** | 既に 226〜235 GB/s（ピーク 273 の 83〜86%）。融合すると A トラフィックが 2 倍になり逆効果 |
+| 大形状向け自動チューナ | **やらない** | 形状ごとに最適が入れ替わり（2048×5120 は stages=3、512×4096 は stages=4）利得 ±5%。測定コストが上回る |
+| `G`（L2 スウィズル）の削除 | **絶対にやらない** | 行優先順序にすると 176 → 105 TOPS（1.7 倍差）。このカーネルで最も効く部分 |
+
+---
+
+## 8. トラブルシューティング
+
+| 症状 | 原因 / 対処 |
+| :--- | :--- |
+| `ModuleNotFoundError: comfy_kitchen` | editable の向き先（リポジトリ）が消えた。§4 を再実行 |
+| ビルドは通るが遅い（CUTLASS と変わらない） | サブモジュール未初期化で `cutlass_gemm_int8.cu` がダミー化。`rm -rf build` → §4.1 から |
+| `Kernel requires a runtime memory allocation, but no allocator was set` | TMA 記述子を使う実験時のみ。`triton.set_allocator(...)` を設定 |
+| `stderr` に `Triton INT8 GEMM failed ... falling back to CUTLASS` | `_triton_int8_broken` が立ち、そのセッションは CUTLASS 固定。原因（多くは Python.h 不在や Triton のコンパイル失敗）を直してプロセス再起動 |
+| `Python.h` が見つからない | `_ensure_python_headers()` のフォールバック（`/opt/py312-include`、コンテナ用）。ホスト venv では `sysconfig` の include が使われる |
+| 数値が CUTLASS と一致しない | ランチャーの `BM/BN/BK/G/warps/stages` を定数のままにしている（§3.1 の罠）。ただし **N が16の倍数でない場合は上流 CUTLASS の方が壊れている**（§10.4）ので、厳密参照で判定する |
+| `expand()` したスケールで値が壊れる / OOB | ゲートが `is_contiguous()` を要求する。呼び出し側で `.contiguous()` するか、CUTLASS に落とす |
+| `torch.compile` で autograd エラー | `requires_grad` 付き入力は意図的に Python trace へ落とす（§10.1）。訓練で使うなら custom op に autograd 登録が必要 |
+
+---
+
+## 9. 実測リファレンス（dgxspark1, 2026-10-30）
+
+環境: GB10 / 48 SM / 2190 MHz（上限 2418、実運用は 2200 cap）/ Triton 3.9.0 / torch 2.15.0+cu132。
+
+### 9.1 実用天井
+
+| 経路 | 2048×5120×5120 | 4096³ |
+| :--- | ---: | ---: |
+| 本カーネル INT8 | **176.5 TOPS** | 177.5 |
+| CUTLASS INT8 | 137–181 | 137 |
+| cuBLAS INT8 | 133 | 140 |
+| cuBLAS FP8 | **178** | 162 |
+| cuBLAS BF16 | 84 TFLOPS | 91 |
+
+レガシー IMMA の理論天井 = 48 SM × 2.19 GHz × 1024 MAC/cycle ≈ **215 TOPS**（達成率 82%）。cuBLAS 最速が 178 である以上、ライブラリ置換の余地はない。
+
+### 9.2 形状別（N=K=4096、変更後）
+
+| M | TOPS | タイル |
+| ---: | ---: | :--- |
+| 32 | 43 | 64x64 |
+| 64 | 83 | 64x64 |
+| 160 | 119 | 64x128 |
+| 192 | 135 | 64x128 |
+| 256 | 128 | 128x64 |
+| 384 | 171 | 128x128 |
+| 512 | 155 | 128x128 |
+| 1024 | 160 | 128x128 |
+| 4096 | 178 | 128x128 |
+| 27280 | 172 | 128x128 |
+
+M=384 が 171 で M=512 が 155 なのは **ウェーブ量子化**（48 SM に対し CTA 数が 96 = 2 波ちょうど vs 128 = 2.67 波）。
+
+### 9.3 レイヤー内訳（N=K=4096）
+
+| M | 量子化 | GEMM | 合計 | GEMM 比率 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 10.9 µs | 112.5 µs | 131.8 µs | 85% |
+| 4096 | 212.6 µs | 783.4 µs | 1026 µs | 76% |
+| 27280 | 1424 µs | 5334 µs | 6634 µs | 80% |
+
+量子化は帯域天井（ピークの 83〜86%）に達しており、削る余地はない。
+
+### 9.4 上流（CUTLASS 経路）との差分 — `int8_linear` 全体、量子化込み
+
+`COMFY_KITCHEN_INT8_MODE=cutlass`（＝上流相当）との比較。量子化パスは両者共通なので、比率は GEMM 単体より圧縮されて見える。
+
+| M (N=K=4096) | 本カーネル | 上流 CUTLASS | 倍率 | ビット一致 |
+| ---: | ---: | ---: | ---: | :--- |
+| 64 | 39.1 µs | 109.3 µs | 2.79x | ✓ |
+| 160 | 54.7 µs | 137.0 µs | 2.50x | ✓ |
+| 192 | 58.7 µs | 146.3 µs | 2.49x | ✓ |
+| 256 | 80.6 µs | 150.0 µs | 1.86x | ✓ |
+| 512 | 137.3 µs | 228.5 µs | 1.66x | ✓ |
+| 4096 | 1013.9 µs | 1141.0 µs | 1.13x | ✓ |
+
+### 9.5 残差融合（`residual` 付き `int8_linear`）
+
+CUTLASS の残差融合カーネル（`cutlass_int8_dequant_residual`）との比較。量子化込み。
+
+| M (N=K=4096) | Triton | CUTLASS | 倍率 |
+| ---: | ---: | ---: | ---: |
+| 64 | 43.6 µs | 160.1 µs | **3.67x** |
+| 160 | 63.1 µs | 199.5 µs | **3.16x** |
+| 256 | 94.3 µs | 220.9 µs | **2.34x** |
+| 512 | 159.2 µs | 288.8 µs | 1.81x |
+| 1024 | 308.9 µs | 307.4 µs | 1.00x |
+| 2048 | 642.8 µs | 702.9 µs | 1.09x |
+| 4096 | 1430.8 µs | 1394.6 µs | 0.97x（誤差範囲） |
+
+- 数値契約は `out = residual + rs[n] * round_out(acc * xs * ws + bias)`。**bias 加算で一旦出力 dtype に丸める**のが CUTLASS の `Add2 → Mul3 → Add4` ビジター列と同じ順序で、ここを省くと一致しない。
+- epilogue が 2枚目の `[BM,BN]` タイルを読むためレジスタ圧が上がる。`m >= 288` の残差形は `BN=64`（`_INT8_GB10_RESIDUAL_TILE`）を使う（`128x128` 比で 8〜12% 速い）。
+- M ≥ 1024 では CUTLASS 残差カーネルと同等。**小〜中 M で大きく勝ち、大 M で損はしない**のが位置づけ。
+
+
+---
+
+## 10. レビュー記録（2026-10-31）
+
+Claude Code（`--effort high`、Read のみ）と Antigravity（Gemini 4 Argon High、sandbox）の2系統で事前レビューし、実コードで再現できた指摘だけ反映した。**両者の結論は割れた**（Claude: BLOCKING 0 / agy: BLOCKING 4）ため、以下は1件ずつ検証した結果。
+
+### 10.1 反映した指摘
+
+| 指摘 | 検証 | 対応 |
+| :--- | :--- | :--- |
+| Triton は「現在のデバイス・現在のストリーム」で起動し、`x.device`/`stream_ptr` と食い違うと誤デバイス起動・競合になる | 妥当 | ゲートに `x.get_device() == torch.cuda.current_device()` と `stream_ptr == torch.cuda.current_stream().cuda_stream` を追加（不一致は CUTLASS） |
+| **非連続スケールで OOB 読み出し**: `expand(n)` は `numel==n, stride==0` なので `reshape(-1)` が no-op になり、1要素バッファの先を読む | **実機で再現**（`stride=(0,)`, `is_contiguous()==False`） | ゲートに `x_scale/w_scale/bias` の `is_contiguous()` を追加＋ランチャ側で `.contiguous()` を materialize |
+| `(1,1)` の `weight_scale` で CUTLASS フォールバックが `expand` に失敗してクラッシュ（`m < 24` で顕在化） | **実機で再現**（`RuntimeError: expand(...[1,1], size=[64])`） | `w_scale.reshape(-1)[:1].expand(n)` に修正（3箇所） |
+| 非 `sm_121` で GB10 タイルを強制すると 64 KB 共有メモリ機（sm_75/RDNA）でコンパイル失敗 | 妥当（4段×16KB＝64KB） | `_INT8_PORTABLE_TILE = (128,128,32,8,8,4)`（32 KB）を非 GB10 に割当 |
+| `torch.compile` 経路が autograd と residual ブロードキャストを壊す | 妥当（custom op に autograd 無し、fake 実装が residual を無視） | 高速パスは `residual is None` かつ `requires_grad` 無しのときだけに限定。それ以外は従来どおり Python を trace |
+| `/opt/py312-include` から **別バージョンの** `Python.h` を借りる | 妥当（ABI 破壊リスク） | 同一 `major.minor` のみ許可（`python3.12` フォールバックを削除） |
+| モードファイルの不正バイトで `UnicodeDecodeError` → import 失敗 | 妥当 | `errors="replace"` ＋ `except (OSError, ValueError)` |
+| int32 飽和は K ≥ 131072 で分岐し得る | 妥当（理論値） | ゲートに `k < 131072` |
+| テスト不足（`gid>=1`、EVEN、E2E、edge shape、スケール連続性） | 妥当 | 5テスト追加（下記 §3.4） |
+
+### 10.2 反映しなかった指摘（理由つき）
+
+| 指摘 | 判断 |
+| :--- | :--- |
+| `rk * sbk` など K 方向のストライド積が int32 で溢れ得る | 閾値が `sbk >= 33,554,432`（＝転置重みで N が3300万行）。現実の形状で到達せず、int64 化はレジスタ圧と速度に影響するため見送り。コメントで明示 |
+| スウィズルの端数グループで M タイル順が巡回する | 全単射で正しさに影響なし（L2 局所性のみ）。`pm = fm + ((pid % (G*npn)) % gs)` は等価なので変更せず |
+| `_DISABLE_CUTLASS_INT8` が import 時固定で、後からの env 変更が効かない | 上流からの既存設計。挙動を変えると事故になるため保留（§10.3 に記載） |
+| 残差融合パス（`cutlass_int8_dequant_residual`）が Triton を使わない | **対応した**（§9.5）。epilogue に `residual + rs*round_out(...)` を実装し、CUTLASS とビット一致を24ケースで確認 |
+| `w4a8_int8_linear` の `s_channel` 正規化・`_DISABLE_CUTLASS_INT8` 尊重 | 連続性はゲートで担保済み。それ以外は上流挙動を維持 |
+
+### 10.3 既知の制限（意図的に変更しない）
+
+- ~~残差融合パスは CUTLASS のまま~~ → **対応済み**（§9.5）。残差は Triton の epilogue で融合し、CUTLASS 残差カーネルとビット一致する。
+- **非 GB10 では autotune が無い**。上流の autotuned カーネル2本は置換・削除した。ROCm 等で詰めるなら上流の `_int8_matmul_dequant_kernel` を復活させること。
+- **`K==0` の挙動が CUTLASS と違う**（Triton は bias か 0 を書く、CUTLASS は何も書かない）。未初期化メモリを返さない分だけ安全側。
+- **`COMFY_KITCHEN_INT8_MODE` は呼び出しごとに読むが、`_DISABLE_CUTLASS_INT8` は import 時固定**（上流由来の非対称）。
+
+### 10.4 上流のバグを発見（重要）
+
+**`N` が 16 の倍数でない場合、上流 CUTLASS カーネルは壊れた出力を返す。** 実測（M=24, K=256, bf16）:
+
+| N | Triton の誤差（厳密参照比） | CUTLASS の誤差 |
+| ---: | ---: | ---: |
+| 1 | 0.000000 | 41.0 |
+| 7 | 0.000000 | 5,275,648.5 |
+| 33 | 0.000000 | **NaN** |
+| 16 / 48 / 64 | 0.000000 | 0.000000 |
+
+`torch._int_mm`（cuBLAS INT8）も `N % 8 != 0` を拒否するため、この領域は元々サポート外と見られる。Triton 側は厳密参照と一致するので、**ゲートは N で制限しない**（CUTLASS より正しい方を選ぶ）。テストは CUTLASS 比較ではなく厳密参照比較にした（`test_edge_shapes_match_exact_reference`）。
+
+### 10.5 ラウンド2レビュー（Claude Opus 5.5, 2026-10-31）
+
+残差融合の追加分に対して再レビュー。**epilogue の数式は CUTLASS と全項目一致**（Mul0/Mul1 の順序、Add2 の丸め、bias 無しでも丸める点、Mul3/Add4、rscale のブロードキャスト、fp32/fp16 の挙動、residual ロードの stride とマスク）と確認された上で、5件の指摘。
+
+| 指摘 | 対応 |
+| :--- | :--- |
+| CPU（他デバイス）の `residual_scale` がゲートを通り、Triton 内で例外→`_triton_int8_broken` が立ち**セッション中ずっと遅い経路**になる | ゲートに `residual.device == out.device` と `residual_scale.device == out.device` を追加 |
+| `test_residual_routes_match_end_to_end` が「両方 CUTLASS」でも通ってしまう（自明な合格） | スパイで `residual is not None` 付きの Triton 呼び出しを検証 |
+| ランチャーが `False` を返すと CUTLASS 残差パスも飛ばして融合を失う（size-1 次元の stride 差で起こり得る） | `if triton_int8_gemm_dequant(...): return True` にして False なら CUTLASS に落とす |
+| bias 無しのとき `-0.0` の符号が CUTLASS と違う（CUTLASS は Bias ビジターで `+0.0` を足す） | `HAS_RESIDUAL` かつ bias 無しのとき `out = out + 0.0` を追加 |
+| `_aligned16(resid_2d)` と `residual_scale.is_contiguous()` は CUTLASS の制約なのに Triton 経路まで CUTLASS に落としている | アラインメント検査を CUTLASS 分岐へ移動（非整列は `return False`）、rscale はランチャで `.contiguous()` |
+
+テストは scalar `residual_scale` / scalar `weight_scale` / `-0.0` / CPU スケールの4ケースを追加（合計 **263 passed**）。

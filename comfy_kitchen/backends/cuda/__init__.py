@@ -1047,14 +1047,13 @@ def _int4_linear_via_int8_values(
         and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_int8)
     ):
-        ws_cutlass = weight_scale_arg if weight_scale_arg.numel() == n else weight_scale_arg.expand(n).contiguous()
-        used_cutlass = _C.cutlass_int8_dequant(
-            _wrap_for_dlpack(x_int8),
-            _wrap_for_dlpack(weight_int8),
-            _wrap_for_dlpack(x_scale_arg.reshape(m, 1)),
-            _wrap_for_dlpack(ws_cutlass),
-            _wrap_for_dlpack(bias_arg),
-            _wrap_for_dlpack(output),
+        used_cutlass = _cutlass_int8_dequant(
+            x_int8,
+            weight_int8,
+            x_scale_arg.reshape(m, 1),
+            weight_scale_arg,
+            bias_arg,
+            output,
             DTYPE_TO_CODE[out_dtype],
             torch.cuda.current_stream(x_int8.device).cuda_stream,
         )
@@ -1672,9 +1671,173 @@ def quantize_int8_rowwise_convrot64(
 # larger rows fall back to the rotate-matmul + rowwise-quant path.
 _CONVROT_FUSED_MAX_K = 16384
 
-# Set COMFY_KITCHEN_DISABLE_CUTLASS=1 to force the cuBLAS int8 GEMM + separate
-# dequant path (for benchmarking against the CUTLASS fused kernel).
-_DISABLE_CUTLASS_INT8 = os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
+_INT8_MODE_FILE = os.environ.get("COMFY_KITCHEN_INT8_MODE_FILE", "/etc/comfy-kitchen-int8.mode")
+# Below this M the CUTLASS kernel wins (measured on GB10: 14.8-24.5 us for M<=16
+# vs 23-28 us for Triton); at M>=24 Triton is ahead and at M=64 it is 4.5x ahead
+# (25.7 us vs 116.8 us), so the gate used to send the worst part of the range to
+# the slower kernel.
+_TRITON_INT8_MIN_M = 24
+_triton_int8_broken = False
+
+
+def _read_int8_mode() -> str:
+    env_mode = os.environ.get("COMFY_KITCHEN_INT8_MODE", "").strip().lower()
+    if env_mode:
+        return env_mode
+    try:
+        with open(_INT8_MODE_FILE, encoding="utf-8", errors="replace") as f:
+            return f.read().strip().lower()
+    except (OSError, ValueError):
+        # A missing file is the normal case; an unreadable or undecodable one must
+        # not break `import comfy_kitchen`.
+        return ""
+
+
+_INT8_MODE = _read_int8_mode()
+
+# Set COMFY_KITCHEN_DISABLE_CUTLASS=1 (or COMFY_KITCHEN_INT8_MODE=cublas) to force
+# the cuBLAS int8 GEMM + separate dequant path (for benchmarking against the
+# CUTLASS fused kernel).
+_DISABLE_CUTLASS_INT8 = (
+    os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
+    or _INT8_MODE == "cublas"
+)
+
+
+def _should_use_triton_int8_dequant(device_index: int) -> bool:
+    mode = os.environ.get("COMFY_KITCHEN_INT8_MODE", "").strip().lower() or _INT8_MODE
+    if mode in ("off", "cutlass", "cublas", "0", "false"):
+        return False
+    if mode == "triton":
+        return True
+    # On NVIDIA GB10 (sm_121), the SM80-targeted CUTLASS INT8 kernel reaches
+    # only ~37% of peak TOPS on large-M shapes, whereas the tuned Triton
+    # fused-dequant INT8 GEMM reaches ~88% of peak while staying bit-identical.
+    return _cuda_device_capability(device_index) == (12, 1)
+
+
+def _cutlass_int8_dequant(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    output_dtype_code: int,
+    stream_ptr: int,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> bool:
+    """Run the fused INT8 GEMM, preferring Triton on sm_121 and falling back to CUTLASS.
+
+    With ``residual`` both paths reproduce ``cutlass_int8_dequant_residual``:
+    ``out = residual + residual_scale * round_out(acc * x_scale * w_scale + bias)``.
+    """
+    global _triton_int8_broken
+    m, k = x.shape
+    n = w.shape[0]
+    use_residual = residual is not None
+    # The Triton kernel launches on PyTorch's current device and stream, not on
+    # (x.device, stream_ptr). Both checks keep a mismatched caller on CUTLASS
+    # instead of launching against the wrong GPU or racing the producer. They sit
+    # at the end of the gate so the short-circuit keeps the cheap path cheap.
+    if (
+        not _triton_int8_broken
+        and m >= _TRITON_INT8_MIN_M
+        and k % 16 == 0
+        and k < 131072  # int32 accumulator: 127*127*131072 still fits; satfinite vs wrap diverges past it
+        and w.dim() == 2
+        and w.shape[1] == k
+        and x.dtype == torch.int8
+        and w.dtype == torch.int8
+        and x.is_contiguous()
+        and w.is_contiguous()
+        and out.is_contiguous()
+        and out.shape == (m, n)
+        and out.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and (
+            not use_residual
+            or (
+                residual.dtype == out.dtype
+                and residual.is_contiguous()
+                and residual.shape == out.shape
+                and residual.device == out.device
+                and residual_scale is not None
+                and residual_scale.dtype == out.dtype
+                and residual_scale.device == out.device
+                and residual_scale.numel() in (1, n)
+            )
+        )
+        and x_scale.dtype == torch.float32
+        and x_scale.numel() == m
+        and x_scale.is_contiguous()
+        and w_scale.dtype == torch.float32
+        and w_scale.numel() in (1, n)
+        and w_scale.is_contiguous()
+        and (
+            bias.numel() == 0
+            or (bias.numel() == n and bias.dtype == out.dtype and bias.is_contiguous())
+        )
+        and x.get_device() == torch.cuda.current_device()
+        and stream_ptr == torch.cuda.current_stream().cuda_stream
+        and _should_use_triton_int8_dequant(x.get_device())
+    ):
+        try:
+            from comfy_kitchen.backends.triton.quantization import (
+                triton_int8_gemm_dequant,
+            )
+
+            if triton_int8_gemm_dequant(
+                x, w, x_scale, w_scale, bias, out,
+                residual=residual, residual_scale=residual_scale,
+            ):
+                return True
+            # The launcher rejected the tensors (e.g. a stride mismatch on a size-1
+            # dim): fall through to CUTLASS instead of losing the fused residual.
+        except Exception as e:
+            _triton_int8_broken = True
+            print(
+                f"[comfy_kitchen] Triton INT8 GEMM failed ({type(e).__name__}: {e}); "
+                f"falling back to CUTLASS for remainder of session",
+                file=sys.stderr,
+            )
+
+    ws_cutlass = (
+        w_scale.reshape(-1).contiguous()
+        if w_scale.numel() == n
+        else w_scale.reshape(-1)[:1].expand(n).contiguous()
+    )
+    if use_residual:
+        # The C++ residual epilogue loads 16-byte vectors; Triton does not care.
+        if not _aligned16(residual):
+            return False
+        # The C++ residual epilogue reads rscale as a full [n] vector.
+        assert residual_scale is not None, "residual requires residual_scale"
+        rs_vec = residual_scale.reshape(-1)
+        if rs_vec.numel() == 1:
+            rs_vec = rs_vec[:1].expand(n).contiguous()
+        return _C.cutlass_int8_dequant_residual(
+            _wrap_for_dlpack(x),
+            _wrap_for_dlpack(w),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(ws_cutlass),
+            _wrap_for_dlpack(bias),
+            _wrap_for_dlpack(_gemm_vector_arg(rs_vec, x.device, out.dtype)),
+            _wrap_for_dlpack(residual),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            stream_ptr,
+        )
+    return _C.cutlass_int8_dequant(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(w),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(ws_cutlass),
+        _wrap_for_dlpack(bias),
+        _wrap_for_dlpack(out),
+        output_dtype_code,
+        stream_ptr,
+    )
 
 
 def quantize_int8_tensorwise(
@@ -2344,36 +2507,37 @@ def int8_linear(
         and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
     ):
-        ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
         # the residual is fused only in the output dtype and 16-byte aligned
         # (the epilogue's vector loads); the per-channel scale is realigned instead
         resid_2d = None
         if residual is not None and residual.dtype == out_dtype and residual_scale.dtype == out_dtype:
+            # 16-byte alignment is only a CUTLASS epilogue requirement (checked in
+            # _cutlass_int8_dequant before it takes that path); Triton is fine without.
             resid_2d = residual.reshape(m, n).contiguous()
-            if not _aligned16(resid_2d):
-                resid_2d = None
         if resid_2d is not None:
-            used_cutlass = _C.cutlass_int8_dequant_residual(
-                _wrap_for_dlpack(x_qdata),
-                _wrap_for_dlpack(weight),
-                _wrap_for_dlpack(x_scale),
-                _wrap_for_dlpack(ws_cutlass),
-                _wrap_for_dlpack(bias_arg),
-                _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)),
-                _wrap_for_dlpack(resid_2d),
-                _wrap_for_dlpack(out),
+            # The residual epilogue is fused in both paths (Triton on sm_121, CUTLASS
+            # elsewhere); _cutlass_int8_dequant picks one and reproduces the same bits.
+            used_cutlass = _cutlass_int8_dequant(
+                x_qdata,
+                weight,
+                x_scale,
+                weight_scale,
+                bias_arg,
+                out,
                 output_dtype_code,
                 stream_ptr,
+                residual=resid_2d,
+                residual_scale=residual_scale,
             )
             fused_residual_done = used_cutlass
         if not used_cutlass:
-            used_cutlass = _C.cutlass_int8_dequant(
-                _wrap_for_dlpack(x_qdata),
-                _wrap_for_dlpack(weight),
-                _wrap_for_dlpack(x_scale),
-                _wrap_for_dlpack(ws_cutlass),
-                _wrap_for_dlpack(bias_arg),
-                _wrap_for_dlpack(out),
+            used_cutlass = _cutlass_int8_dequant(
+                x_qdata,
+                weight,
+                x_scale,
+                weight_scale,
+                bias_arg,
+                out,
                 output_dtype_code,
                 stream_ptr,
             )
@@ -2617,13 +2781,13 @@ def w4a8_int8_linear(
 
     int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
 
-    used = _C.cutlass_int8_dequant(
-        _wrap_for_dlpack(xq),
-        _wrap_for_dlpack(int8_weight),
-        _wrap_for_dlpack(xs),
-        _wrap_for_dlpack(s_channel),
-        _wrap_for_dlpack(bias_arg if bias_arg is not None else _empty_cuda_tensor(x.device, out_dtype)),
-        _wrap_for_dlpack(out),
+    used = _cutlass_int8_dequant(
+        xq,
+        int8_weight,
+        xs,
+        s_channel,
+        bias_arg if bias_arg is not None else _empty_cuda_tensor(x.device, out_dtype),
+        out,
         output_dtype_code,
         stream_ptr,
     )
