@@ -47,10 +47,18 @@ def _rne_bf16(v):
 
 @triton.jit
 def _rne_fp16(v):
-    """fp16 counterpart of ``_rne_bf16``: 13 discarded mantissa bits, 0x0FFF half ulp."""
-    b = v.to(tl.int32, bitcast=True)
-    b = (b + 0x0FFF + ((b >> 13) & 1)) & -8192
-    return b.to(tl.float32, bitcast=True)
+    """Round fp32 to fp16 precision (RNE).
+
+    The bf16-style integer trick does not work here: fp16 has a 5-bit exponent, so
+    truncating the fp32 mantissa rounds the subnormal band (|x| < 6.1e-5) at the
+    wrong granularity. A real ``cvt.rn.f16.f32`` is exact over the whole range and
+    cannot be folded into an FMA.
+    """
+    h = tl.inline_asm_elementwise(
+        "cvt.rn.f16.f32 $0, $1;", "=h,r", [v],
+        dtype=tl.float16, is_pure=True, pack=1,
+    )
+    return h.to(tl.float32)
 
 
 @triton.jit
@@ -64,15 +72,23 @@ def _scale_shift_kernel(x_ptr, s_ptr, shift_ptr, row_mod_ptr, y_ptr, n_elements,
     m_base = mod.to(tl.int64) * n_elements
 
     x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-    s1 = 1.0 + tl.load(s_ptr + m_base + offs, mask=mask, other=0.0).to(tl.float32)
-    sh = tl.load(shift_ptr + m_base + offs, mask=mask, other=0.0).to(tl.float32)
+    s_raw = tl.load(s_ptr + m_base + offs, mask=mask, other=0.0).to(tl.float32)
+    sh_raw = tl.load(shift_ptr + m_base + offs, mask=mask, other=0.0).to(tl.float32)
 
+    # torch does _mod_row(scale, row, h.dtype) first, i.e. it rounds the modulation
+    # tensors to the activation dtype before touching them. H3's curve checkpoints
+    # keep the adaln output in fp32, so skipping this cast moves ~38% of the outputs
+    # (max 0.125) even though the arithmetic below is right.
     if DTYPE_CODE == 2:
-        y = _rne_bf16(_rne_bf16(x * _rne_bf16(s1)) + sh).to(tl.bfloat16)
+        s1 = _rne_bf16(1.0 + _rne_bf16(s_raw))
+        sh = _rne_bf16(sh_raw)
+        y = _rne_bf16(_rne_bf16(x * s1) + sh).to(tl.bfloat16)
     elif DTYPE_CODE == 1:
-        y = _rne_fp16(_rne_fp16(x * _rne_fp16(s1)) + sh).to(tl.float16)
+        s1 = _rne_fp16(1.0 + _rne_fp16(s_raw))
+        sh = _rne_fp16(sh_raw)
+        y = _rne_fp16(_rne_fp16(x * s1) + sh).to(tl.float16)
     else:
-        y = x * s1 + sh
+        y = x * (1.0 + s_raw) + sh_raw
     tl.store(y_ptr + base + offs, y, mask=mask)
 
 
@@ -104,6 +120,14 @@ def scale_shift(h: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor,
     The result is a new tensor; ``h`` is left untouched.
     """
     rows, cols = h.shape
+    if h.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        # The kernel has no rounding contract for other dtypes; refuse rather than
+        # silently returning something that is not bit-identical to torch.
+        raise TypeError(f"scale_shift: unsupported activation dtype {h.dtype}")
+    if scale.shape[-1] != cols or shift.shape[-1] != cols:
+        raise ValueError(
+            f"scale_shift: modulation width {scale.shape[-1]}/{shift.shape[-1]} != {cols}"
+        )
     out = torch.empty_like(h)
     code = 1 if h.dtype == torch.float16 else 2 if h.dtype == torch.bfloat16 else 0
     grid = (rows, triton.cdiv(cols, block))
