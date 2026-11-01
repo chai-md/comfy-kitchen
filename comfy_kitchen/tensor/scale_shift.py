@@ -95,14 +95,27 @@ def _scale_shift_kernel(x_ptr, s_ptr, shift_ptr, row_mod_ptr, y_ptr, n_elements,
 def row_mod_from_segments(rows: int, segments, device) -> torch.Tensor:
     """Build the per-token modulation index from [(start, stop, row), ...].
 
-    ``row`` may be an int or a per-token index tensor.
+    ``row`` may be an int or a per-token index tensor. The segments must tile
+    ``range(rows)``: torch leaves uncovered rows untouched, whereas an uninitialised
+    index would apply some other row's modulation, so a gap is an error.
     """
-    row_mod = torch.empty(rows, dtype=torch.int32, device=device)
+    row_mod = torch.full((rows,), -1, dtype=torch.int32, device=device)
     for a, b, r in segments:
         if isinstance(r, torch.Tensor):
-            row_mod[a:b] = r.to(torch.int32)
+            idx = r.to(torch.int32).reshape(-1)
+            if idx.numel() != b - a:
+                raise ValueError(
+                    f"scale_shift: segment [{a}:{b}) has {idx.numel()} mod-row indices"
+                )
+            row_mod[a:b] = idx
         else:
             row_mod[a:b] = r
+    gap = row_mod < 0
+    if bool(gap.any()):
+        raise ValueError(
+            f"scale_shift: {int(gap.sum())} rows have no mod row "
+            f"(first {int(gap.nonzero()[0])})"
+        )
     return row_mod
 
 
@@ -128,7 +141,23 @@ def scale_shift(h: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor,
         raise ValueError(
             f"scale_shift: modulation width {scale.shape[-1]}/{shift.shape[-1]} != {cols}"
         )
-    out = torch.empty_like(h)
+    if not h.is_contiguous():
+        # The kernel addresses rows as row * cols; a strided view would be read and
+        # written at the wrong offsets.
+        raise ValueError("scale_shift: activation must be contiguous")
+    # The modulation tensors are addressed the same way. ComfyUI slices them out of a
+    # wider [R, n*cols] adaLN projection, which is a strided view -- a few hundred KB
+    # of .contiguous() per call keeps the kernel address math trivial. (A strided
+    # scale/shift silently read the wrong row for every mod row but the first.)
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    if not shift.is_contiguous():
+        shift = shift.contiguous()
+    if not row_mod.is_contiguous():
+        row_mod = row_mod.contiguous()
+    # empty_like would inherit a non-contiguous memory format; the kernel writes
+    # row-major, so always allocate a dense buffer.
+    out = torch.empty_like(h, memory_format=torch.contiguous_format)
     code = 1 if h.dtype == torch.float16 else 2 if h.dtype == torch.bfloat16 else 0
     grid = (rows, triton.cdiv(cols, block))
     _scale_shift_kernel[grid](h, scale, shift, row_mod, out, cols,
