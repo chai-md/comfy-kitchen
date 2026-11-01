@@ -1,0 +1,72 @@
+diff --git a/comfy/ldm/minimax/model.py b/comfy/ldm/minimax/model.py
+index 6e3884b7..0d1c6bf0 100644
+--- a/comfy/ldm/minimax/model.py
++++ b/comfy/ldm/minimax/model.py
+@@ -15,6 +15,7 @@ velocity back, so _forward only ever sees the stream's own latent.
+ """
+ 
+ import math
++import sys
+ 
+ import torch
+ import torch.nn as nn
+@@ -228,18 +229,57 @@ class AdalnProj(nn.Module):
+         return x.chunk(self.expand, dim=-1)
+ 
+ 
++try:
++    from comfy_kitchen.tensor.scale_shift import scale_shift as _ck_scale_shift
++    from comfy_kitchen.tensor.scale_shift import row_mod_from_segments as _ck_row_mod
++except Exception:  # comfy-kitchen without the fused kernel (or no triton)
++    _ck_scale_shift = None
++    _ck_row_mod = None
++_ck_scale_shift_warned = False
++
++
+ def _mod_row(vecs, row, dtype):
+     # row is a mod-row index, or a per-token LongTensor of mod-row indices
+     return vecs[row].to(dtype)
+ 
+ 
+-def _mod_scale_shift(h, shift, scale, segments):
+-    # segments: [(start, stop, mod_row)] covering h contiguously.
++def _mod_scale_shift_ref(h, shift, scale, segments):
++    """Reference (torch) implementation, used whenever the fused kernel declines."""
+     for a, b, row in segments:
+         h[a:b].mul_(1.0 + _mod_row(scale, row, h.dtype)).add_(_mod_row(shift, row, h.dtype))
+     return h
+ 
+ 
++def _mod_scale_shift(h, shift, scale, segments):
++    # segments: [(start, stop, mod_row)] tiling h's rows; mod_row is an index or a
++    # per-token index tensor.
++    #
++    # torch does two read-modify-write passes over the bf16 matrix, which runs at
++    # 115-150 GB/s on GB10 (write-allocate). comfy-kitchen's Triton kernel does the
++    # same arithmetic in one out-of-place pass at ~222 GB/s: 8092us -> 2721us at
++    # M=27280/K=5376, bit-identical (the kernel re-imposes both bf16 roundings with
++    # integer math, because Triton would otherwise contract mul+add into one FMA).
++    #
++    # Two things the kernel needs and torch does not: a contiguous activation, and
++    # modulation tensors it can index as row * cols (it materialises strided views
++    # itself). Anything else raises, and we fall back here — the fallback is loud
++    # once so a regression cannot hide behind a silent 2x slowdown.
++    if (
++        _ck_scale_shift is not None
++        and h.dtype in (torch.bfloat16, torch.float16)
++        and h.shape[1] >= 256
++    ):
++        try:
++            row_mod = _ck_row_mod(h.shape[0], segments, h.device)
++            return _ck_scale_shift(h, scale, shift, row_mod)
++        except Exception as exc:
++            global _ck_scale_shift_warned
++            if not _ck_scale_shift_warned:
++                print(f"comfy-kitchen fused modulation disabled: {exc!r}", file=sys.stderr)
++                _ck_scale_shift_warned = True
++    return _mod_scale_shift_ref(h, shift, scale, segments)
++
++
+ def _mod_gate(x, gate, other, segments):
+     # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
+     for a, b, row in segments:
