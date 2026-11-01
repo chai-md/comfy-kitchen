@@ -125,6 +125,52 @@ def test_inplace_helper_and_input_untouched():
 
 
 @pytest.mark.skipif(not DEVICES, reason="needs CUDA")
+def test_strided_modulation_view():
+    """ComfyUI slices scale/shift out of a wider [R, n*cols] adaLN projection.
+
+    A [R, cols] view with row stride n*cols is not contiguous; addressing it as
+    row*cols reads the wrong row for every mod row but the first, which is exactly
+    how a real H3 render diverged while every contiguous test passed.
+    """
+    rows, cols = 1024, 2048
+    big_scale = torch.randn(3, 6, cols, dtype=torch.float32, device="cuda")
+    big_shift = torch.randn(3, 6, cols, dtype=torch.float32, device="cuda")
+    scale, shift = big_scale[:, 0], big_shift[:, 0]
+    assert not scale.is_contiguous()
+
+    h = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+    segs = [(0, 100, 1), (100, 400, 2), (400, rows, 0)]
+    got = scale_shift(h, scale, shift, row_mod_from_segments(rows, segs, h.device))
+    ref = _reference(h, shift, scale, segs)
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+
+
+@pytest.mark.skipif(not DEVICES, reason="needs CUDA")
+def test_partial_coverage_raises():
+    with pytest.raises(ValueError, match="have no mod row"):
+        row_mod_from_segments(10, [(0, 5, 0)], "cuda")
+
+
+@pytest.mark.skipif(not DEVICES, reason="needs CUDA")
+def test_index_length_mismatch_raises():
+    idx = torch.zeros(4, dtype=torch.long, device="cuda")
+    with pytest.raises(ValueError, match="mod-row indices"):
+        row_mod_from_segments(10, [(0, 5, idx), (5, 10, 0)], "cuda")
+
+
+@pytest.mark.skipif(not DEVICES, reason="needs CUDA")
+def test_rejects_strided_activation():
+    base = torch.randn(64, 512, dtype=torch.bfloat16, device="cuda")
+    h = base[:, ::2]
+    scale = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
+    shift = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
+    row_mod = row_mod_from_segments(64, [(0, 64, 0)], h.device)
+    with pytest.raises(ValueError, match="contiguous"):
+        scale_shift(h, scale, shift, row_mod)
+
+
+@pytest.mark.skipif(not DEVICES, reason="needs CUDA")
 def test_rejects_non_float_activation():
     h = torch.randint(0, 100, (64, 256), dtype=torch.int32, device="cuda")
     scale = torch.randn(1, 256, dtype=torch.float32, device="cuda")
