@@ -1280,9 +1280,13 @@ class TestTritonInt8GemmDequant:
         assert torch.equal(got, ref)
 
     @requires_cuda_backend
-    @pytest.mark.parametrize("m,expect_triton", [(16, False), (23, False), (24, True), (64, True), (127, True)])
+    @pytest.mark.parametrize("m,expect_triton", [(16, False), (24, False), (39, False), (40, True), (64, True), (127, True)])
     def test_dispatch_gate_opens_below_128(self, m, expect_triton, monkeypatch, seed):
-        """M in [24,128) used to be routed to CUTLASS, which is 4.5x slower at M=64."""
+        """M in [40,128) is routed to Triton; below 40 the CUTLASS path is faster.
+
+        Measured end-to-end (int8_linear, 4096x4096, vanilla comfy-kitchen as the
+        baseline): 0.78-0.82x at M=24-32, 1.06x at 40-48, 1.59x at 56, 2.17x at 64.
+        """
         from comfy_kitchen.backends import cuda as cuda_backend
         from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
         from comfy_kitchen.backends.triton import quantization as triton_quant
