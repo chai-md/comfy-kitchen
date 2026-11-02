@@ -3,7 +3,7 @@
 上流 `Comfy-Org/comfy-kitchen` をフォークし、**GB10 (sm_121) 用の INT8 GEMM 最適化を再適用**するための手順書です。上流の新リリースに追従するたびに、この文書の §3→§5 を繰り返せば同じ状態に戻せます。
 
 - 対象機: dgxspark1（GB10 / 48 SM / 2190 MHz、クロック上限 2200）
-- 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、Python venv = `/home/chai/ComfyUI/.venv`
+- 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、**作業は `source .venv/bin/activate` した venv の中で行う**（§4.2）
 - ベース: `comfy-kitchen` v0.2.40、コミット `cdab478`
 - 変更は **Python のみ**（CUDA/C++ の変更なし。`_C.abi3.so` は再ビルドで作り直すが、差分は無い）
 
@@ -63,7 +63,7 @@ python bench/bench_int8_baseline.py vanilla
 | 上流 | `Comfy-Org/comfy-kitchen`（`upstream`） |
 | 作業ブランチ | **`main`**（トピックブランチは切っていない。コミットは上流 `cdab478` の直上に載る） |
 | 変更の実体 | `git log --oneline cdab478..origin/main` の 5 コミット（下記） |
-| ローカル | `/home/chai/comfy-kitchen`、`ComfyUI/.venv` から editable で参照 |
+| ローカル | このリポジトリ。ビルド/テストは直下の `.venv`（`source .venv/bin/activate`）、ComfyUI から使う場合は ComfyUI 側の venv にも editable で入れる（§4.2） |
 
 ```bash
 # フォーク作成 + clone（初回のみ）
@@ -619,32 +619,55 @@ git submodule update --init --depth 1
 
 ### 4.2 ビルド（editable）
 
-`uv pip install` は環境変数頼みだと別インタプリタに入ることがあるので、
-**`--python` で venv を明示する**（この形が実機で通っている）。
+**仮想環境は `source .venv/bin/activate` を前提にする。** ノードごとにパスが違うので、
+`/home/chai/ComfyUI/.venv` のような絶対パスを手順に埋めない（他ノードで必ず失敗する）。
+
+前提: その venv に **torch（2.15+cu132）と triton（3.9）が入っていること**。
+`--no-build-isolation` はビルドに既存の torch を使うため、空の venv では失敗する。
+ComfyUI が動いているノードなら、その ComfyUI の venv を使うのが最短。
 
 ```bash
-cd /home/chai/comfy-kitchen
+cd ~/comfy-kitchen                 # ノードごとのリポジトリ位置
 
-# 不足時のみ
-/home/chai/ComfyUI/.venv/bin/uv pip install --python /home/chai/ComfyUI/.venv/bin/python \
-    nanobind packaging wheel cmake ninja
+# リポジトリ直下に .venv がある場合
+source .venv/bin/activate
+# 無い場合は、そのノードの ComfyUI の venv を使う（torch/triton が揃っている）
+#   source ~/ComfyUI/.venv/bin/activate
 
-COMFY_CUDA_ARCHS=121 /home/chai/ComfyUI/.venv/bin/uv pip install \
-    --python /home/chai/ComfyUI/.venv/bin/python \
-    --no-build-isolation -e .
+which python                      # venv を指していることを確認
+uv pip install nanobind packaging wheel cmake ninja   # 不足時のみ
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+```
+
+まっさらな venv から始める場合だけ、先に依存を入れる（数 GB・数分）。
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -U uv
+uv pip install torch triton        # ComfyUI と同じバージョンに合わせる
 ```
 
 - `COMFY_CUDA_ARCHS=121` で旧世代 arch を省略（20 コアで約 2.5 分）
 - `-e`（editable）なので `_C.abi3.so` はリポジトリ内に置かれ、以後 **Python の修正は再ビルド不要**
 - 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら §4.1 の罠）
-- venv を activate 済みなら `--python` は省略可。`python -m pip` は venv に pip が無いため使わない
+- `uv pip install` は **activate 中の venv に入る**（`VIRTUAL_ENV` を見る）。空のまま実行すると
+  別インタプリタに入って「import できない」になるので、`which python` で `.venv` を指しているか確認する
+- この venv に `pip` モジュールが無い構成でも `uv pip` は動く。`python -m pip` は使わない
 
-ComfyUI から見た向き先の確認:
+#### ComfyUI から使う場合
+
+editable は **venv ごと**に入る。検証だけなら上の `.venv` で足りるが、ComfyUI に読ませるなら
+そのノードの ComfyUI の venv を activate して同じコマンドを流す（`--python` を足すより事故が少ない）。
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "import comfy_kitchen, pathlib; print(pathlib.Path(comfy_kitchen.__file__).parent)"
-# → /home/chai/comfy-kitchen/comfy_kitchen なら editable が効いている
+source ~/ComfyUI/.venv/bin/activate      # ノードごとのパス
+cd ~/comfy-kitchen
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+python -c "import comfy_kitchen, pathlib; print(pathlib.Path(comfy_kitchen.__file__).parent)"
+# → <repo>/comfy_kitchen なら editable が効いている
 ```
+
+再ビルド不要なのは Python 側だけ。**C++/CUDA（`_C.abi3.so`）を触ったら両方の venv で再ビルド**する。
 
 ### 4.3 ComfyUI 側フックの適用
 
@@ -652,10 +675,10 @@ ComfyUI は上流（`Comfy-Org/ComfyUI`）クローンなので push 先が無�
 `patches/comfyui-minimax-modulation.patch` を適用して使う。
 
 ```bash
-git -C /home/chai/ComfyUI apply /home/chai/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 
 # 取り消し（上流に戻す）
-git -C /home/chai/ComfyUI apply -R /home/chai/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+git -C ~/ComfyUI apply -R ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 
 # 上流を pull した後は再適用（競合したら model.py の _mod_scale_shift だけ手で直す）
 ```
@@ -665,7 +688,7 @@ git -C /home/chai/ComfyUI apply -R /home/chai/comfy-kitchen/patches/comfyui-mini
 ### 4.4 インストール直後の動作確認
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 import torch
 from comfy_kitchen.backends import cuda as cb
 import comfy_kitchen.tensor.scale_shift as ss
@@ -688,7 +711,7 @@ print('scale_shift bit-identical:', torch.equal(out, ref))
 ### 5.1 ディスパッチとビット一致
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 import torch, comfy_kitchen
 from comfy_kitchen.backends import cuda as cb
 from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
@@ -719,7 +742,7 @@ for m in (24, 64, 96, 160, 192, 256, 512):
 ### 5.2 タイル表
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 from comfy_kitchen.backends.triton.quantization import _int8_tile_config as f
 for m in (24, 64, 127, 128, 207, 208, 287, 288, 4096):
     print(m, f(m, 4096, 4096)[:2], '|', m, f(m, 5120, 5120)[:2])
@@ -731,8 +754,8 @@ for m in (24, 64, 127, 128, 207, 208, 287, 288, 4096):
 ### 5.3 単体テスト
 
 ```bash
-uv pip install --python /home/chai/ComfyUI/.venv/bin/python pytest   # 未導入なら
-/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
+uv pip install pytest        # 未導入なら
+python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
 ```
 
 期待値: 全件パス（本リポジトリでは `290 passed` = 上流 + 追加 96 ケース）。
@@ -755,11 +778,9 @@ git fetch upstream
 git rebase upstream/main                    # 上流のデフォルトブランチに合わせる
 git submodule update --init --depth 1
 
-COMFY_CUDA_ARCHS=121 /home/chai/ComfyUI/.venv/bin/uv pip install \
-    --python /home/chai/ComfyUI/.venv/bin/python \
-    --no-build-isolation -e .
-
-/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
+source .venv/bin/activate                   # §4.2 の venv
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
 git push --force-with-lease origin main     # rebase したので force
 ```
 
