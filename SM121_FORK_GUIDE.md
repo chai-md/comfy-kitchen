@@ -62,7 +62,7 @@ python bench/bench_int8_baseline.py vanilla
 | フォーク | `chai-md/comfy-kitchen`（`origin`、HTTPS） |
 | 上流 | `Comfy-Org/comfy-kitchen`（`upstream`） |
 | 作業ブランチ | **`main`**（トピックブランチは切っていない。コミットは上流 `cdab478` の直上に載る） |
-| 変更の実体 | `git log --oneline cdab478..origin/main` の 4 コミット（下記） |
+| 変更の実体 | `git log --oneline cdab478..origin/main` の 5 コミット（下記） |
 | ローカル | `/home/chai/comfy-kitchen`、`ComfyUI/.venv` から editable で参照 |
 
 ```bash
@@ -74,7 +74,7 @@ git switch main                     # フォークの main がそのまま作業
 git submodule update --init --depth 1   # 必須（§4.1 の罠）
 ```
 
-履歴はこの 4 つ。**ブランチ名で探さず、この範囲で追う**（フォークの `main` が最新）。
+履歴はこの 5 つ。**ブランチ名で探さず、この範囲で追う**（フォークの `main` が最新）。
 
 | コミット | 内容 |
 | :--- | :--- |
@@ -82,6 +82,7 @@ git submodule update --init --depth 1   # 必須（§4.1 の罠）
 | `fdc854d` | `scale_shift`: 変調テンソルを活性 dtype に丸める（fp32 adaLN 対応。これが無いと H3 の絵が変わる） |
 | `33e16e8` | `scale_shift`: 非連続な変調ビューを `.contiguous()` 化、カバレッジ検証を追加 |
 | `3dc2406` | ComfyUI 側フックを `patches/comfyui-minimax-modulation.patch` として同梱 |
+| `4b14781` | 本指示書の比較基準を素の comfy-kitchen に修正、Triton ゲートを 40 へ、計測スクリプト `bench/` を同梱 |
 
 ```bash
 # 同じ状態を別マシンで再現する場合
