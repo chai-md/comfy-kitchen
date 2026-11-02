@@ -1674,7 +1674,11 @@ _INT8_MODE_FILE = os.environ.get("COMFY_KITCHEN_INT8_MODE_FILE", "/etc/comfy-kit
 # vs 23-28 us for Triton); at M>=24 Triton is ahead and at M=64 it is 4.5x ahead
 # (25.7 us vs 116.8 us), so the gate used to send the worst part of the range to
 # the slower kernel.
-_TRITON_INT8_MIN_M = 24
+# End-to-end crossover against *vanilla* comfy-kitchen (CUTLASS), measured with
+# int8_linear on M x 4096 x 4096: Triton is 0.78-0.82x at M=24-32 (its launch cost
+# dominates), 1.06x at M=40-48, 1.59x at 56 and 2.17x at 64. The gate was 24, which
+# sent the 24-39 band to the slower kernel; 40 is the first width that never loses.
+_TRITON_INT8_MIN_M = 40
 _triton_int8_broken = False
 
 
