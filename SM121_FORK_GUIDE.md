@@ -6,6 +6,7 @@
 - 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、**作業は `source .venv/bin/activate` した venv の中で行う**（§4.2）
 - ベース: `comfy-kitchen` v0.2.40、コミット `cdab478`
 - 変更は **Python のみ**（CUDA/C++ の変更なし。`_C.abi3.so` は再ビルドで作り直すが、差分は無い）
+- 参考: [kanthai/gb10-comfyui-tuning](https://github.com/kanthai/gb10-comfyui-tuning)（謝辞は §11）
 
 ---
 
@@ -1011,3 +1012,36 @@ Claude Code（`--effort high`、Read のみ）と Antigravity（Gemini 4 Argon H
 | `_aligned16(resid_2d)` と `residual_scale.is_contiguous()` は CUTLASS の制約なのに Triton 経路まで CUTLASS に落としている | アラインメント検査を CUTLASS 分岐へ移動（非整列は `return False`）、rscale はランチャで `.contiguous()` |
 
 テストは scalar `residual_scale` / scalar `weight_scale` / `-0.0` / CPU スケールの4ケースを追加（合計 **263 passed**）。
+
+---
+
+## 11. 謝辞 / Acknowledgements
+
+本フォークの方向づけと運用の慣習は、次の公開ノートに負っています。
+
+### kanthai / gb10-comfyui-tuning（MIT）
+
+<https://github.com/kanthai/gb10-comfyui-tuning>
+
+DGX Spark (GB10) 上で ComfyUI + comfy-kitchen を実測したノートとパッチ集。とくに参照した点:
+
+| 参照した内容 | 本フォークでの対応 |
+| :--- | :--- |
+| `docs/02-int8-triton-gemm.md` — comfy-kitchen の CUTLASS 経路は sm_121 でピークの 37%、Triton の融合 dequant GEMM なら 88% | 本フォークの出発点。§0 の「N が広い射影層で 1.5〜2.4 倍」は同じ現象を shape 別に測り直したもの |
+| `docs/03-torch-compile-int8.md` — `torch.compile` 下で INT8 が落ちる原因 | `int8_linear()` の `torch.compiler.is_compiling()` 早期リターン（§3.3） |
+| モード切替の慣習 `COMFY_KITCHEN_INT8_MODE` / `/etc/comfy-kitchen-int8.mode`（`off` で素に戻す） | `_read_int8_mode()` とファイル方式（§3.2） |
+| Triton の実行時コンパイルに `Python.h` が要る件 | `_ensure_python_headers()` とそのメモ化 |
+| A/B・同一シード・ビット一致で確認する計測姿勢 | §5 の検証手順と `bench/` のスクリプト群 |
+
+### 本フォーク側で独自に実装・検証した部分
+
+上記リポジトリのコードは取り込んでいません（向こうは `.pth` で読み込むモンキーパッチ、
+こちらは comfy-kitchen 本体へのフォーク）。以下は本フォークで書いたもの:
+
+- タイル表（M 帯ごとに 64/128 行を選ぶ）と、GB10 以外のデバイス向けフォールバックタイル
+- residual 融合 epilogue（CUTLASS の型順序に合わせ、`torch.equal` でビット一致を検証）
+- `comfy_kitchen/tensor/scale_shift.py`（変調の融合。FMA 融合による中間丸め消失、
+  fp32 adaLN の事前丸め、非連続ビューの 3 点は実測で特定）
+- 形状別の実測（§0）と回帰テスト（`tests/test_int8.py`, `tests/test_scale_shift.py`）
+
+本フォークの誤りは本フォーク側の責任です。原典のライセンスは上記リポジトリの `LICENSE`（MIT）を参照してください。
