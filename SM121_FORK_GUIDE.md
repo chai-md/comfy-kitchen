@@ -16,7 +16,7 @@ H3 の実測（M=15,787）では、1 イテレーションがこう変わる。�
 comfy-kitchen（上流 `cdab478`）**との比較で、同一スクリプトを 2 状態（`switch_kernel_state.sh A`
 と `main`）で流して取得（`bench/bench_h3_breakdown.py`）。
 
-| 段階 | 素 | 本フォーク | 短縮 | 効かせているもの |
+| 段階 | 素 | 本フォーク | 短縮 | 変更元 |
 | :--- | ---: | ---: | ---: | :--- |
 | INT8 GEMM（4線形 × 50層） | 7.87 s | 3.82 s | **−4.05 s** | 本フォークの Triton 経路 |
 | 変調 `scale/shift`（×100） | 0.49 s | 0.16 s | **−0.33 s** | `tensor/scale_shift.py` |
@@ -24,11 +24,10 @@ comfy-kitchen（上流 `cdab478`）**との比較で、同一スクリプトを 
 | attention（×50） | 2.69 s | 2.69 s | 0 | フォーク外（起動フラグ、下記） |
 | **合計** | **11.4 s** | **7.0 s** | **−4.4 s（1.63x）** | |
 
-効くのは **INT8 GEMM（大）と 変調（中）の 2 つだけ**。attention はフォークの効果ではなく
-ComfyUI の起動フラグ `--use-sage-attention` の効果で、SDPA のままだとこの段階で +2.17 s 損する
-（SA2 53.9 ms/層 vs SDPA 96.6 ms/層）。
+効果があるのは **INT8 GEMM と 変調**。attention はフォーク起因ではなく、ComfyUI の起動フラグ
+`--use-sage-attention` による（SA2 53.9 ms/層、SDPA だと 96.6 ms/層でこの段階が 2.69 → 4.86 s）。
 
-### 0.1 レバーは 3 つ。効く条件も 3 行で書ける
+### 0.1 レバーと効く条件
 
 | # | レバー | 効く条件 | 大きさ | 効かない条件 |
 | :--- | :--- | :--- | ---: | :--- |
@@ -36,9 +35,9 @@ ComfyUI の起動フラグ `--use-sage-attention` の効果で、SDPA のまま�
 | 2 | 変調の融合（`scale_shift`） | DiT の pre-norm 変調がある | 3.0x（その段階） | 変調の無いモデル |
 | 3 | attention を SageAttention | ComfyUI の起動フラグ（コード変更なし） | 1.8x（その段階） | SA3 は 1.02x で不可 |
 
-### 0.2 GEMM の効き目は M ではなく N で決まる（最大の誤解点）
+### 0.2 GEMM の効き目は M ではなく N で決まる
 
-M=15,787 固定・K=5,376 での実測:
+M=15,787 固定・K=5,376:
 
 | N | 素 comfy-kitchen | 本フォーク | 倍率 |
 | ---: | ---: | ---: | ---: |
@@ -48,10 +47,8 @@ M=15,787 固定・K=5,376 での実測:
 | 21504（H3 qkv） | 50.25 ms / 72.6 TOPS | 22.50 ms / 162 TOPS | **2.23x** |
 | 28672（H3 fc1） | 69.06 ms / 70.5 TOPS | 29.21 ms / 167 TOPS | **2.36x** |
 
-素の CUTLASS 経路は N が広がると 119 → 62〜75 TOPS に**失速**し、Triton 側は 126 → 148〜167 と
-むしろ伸びる。トランスフォーマの射影層は N = hidden / 3·hidden / 2·ffn なので全部この帯に入る。
-**単体ベンチで常用する N=K=4096 は、差が最も出ない形**（1.06x）で、そこで測ると
-「効かない」と誤結論する。M の大小はこの効果に関係しない（M=15,787 でも N=4096 なら 1.06x）。
+素の CUTLASS は N が広がると 119 → 62〜75 TOPS に低下し、Triton 側は 126 → 148〜167 に上がる。
+射影層は N = hidden / 3·hidden / 2·ffn なのでこの帯に入る。
 
 ### 0.3 細い M は別レバー（同じカーネルのタイル表）
 
@@ -116,7 +113,7 @@ gh repo fork Comfy-Org/comfy-kitchen --clone
 cd comfy-kitchen
 git remote add upstream https://github.com/Comfy-Org/comfy-kitchen.git
 git switch main                     # フォークの main がそのまま作業ブランチ
-git submodule update --init --depth 1   # 必須（§4.1 の罠）
+git submodule update --init --depth 1   # 必須（§4.1）
 ```
 
 履歴はこの 5 つ。**ブランチ名で探さず、この範囲で追う**（フォークの `main` が最新）。
@@ -404,7 +401,8 @@ def triton_int8_gemm_dequant(
 
 ランチャー側は `triton_int8_gemm_dequant(..., residual=..., residual_scale=...)` を受け、`residual is None` のときはダミーポインタ（`out`）を渡して `HAS_RESIDUAL=False` にします。ディスパッチ側は `_cutlass_int8_dequant(..., residual=, residual_scale=)` に統合し、Triton が使えないときだけ `_C.cutlass_int8_dequant_residual` に落とします。
 
-> **再発しやすい罠**: ランチャーの `BM=BN=BK=G=num_warps=num_stages` は必ず変数で渡すこと。ここを定数のまま残すと、グリッドだけタイル選択に従って**結果が壊れます**（§5 の bit-identical 検査で即座に検出できます）。
+> **注意**: ランチャーの `BM=BN=BK=G=num_warps=num_stages` は変数で渡すこと。定数のままだと
+> グリッドだけがタイル選択に従い、**結果が壊れます**（§5 の bit-identical 検査で検出できます）。
 
 ### 3.2 `comfy_kitchen/backends/cuda/__init__.py`
 
@@ -621,7 +619,7 @@ out-of-place で 222 GB/s、実測 **2〜3 倍**。
    fp16 は指数部が 5 bit で subnormal 域の丸めが変わるため `cvt.rn.f16.f32` を使う。
 2. **変調テンソルは先に活性の dtype へ丸める**（`_mod_row` の `.to(h.dtype)`）。
    H3 の curve チェックポイントは adaLN を fp32 で持つので、これを飛ばすと 38% の要素が
-   ずれる（bf16 変調だけ見ていると気付けない）。
+   ずれる（bf16 変調では再現しない）。
 3. **`scale`/`shift` は非連続ビューで来る。** ComfyUI は `[R, n*cols]` から
    `[R, cols]` を切り出すため行ストライドが `n*cols`。`row*cols` で索引すると
    mod 行 0 以外が全部ずれる（実測: 15787 行中 802 行が不一致）。呼び出し前に
@@ -641,14 +639,14 @@ mod 行テンソルにも対応する。
 ComfyUI は上流クローンなので、フックは `patches/comfyui-minimax-modulation.patch`
 として本リポジトリに同梱している（適用は §4.3）。`_mod_scale_shift()` が
 comfy-kitchen のカーネルを使い、前提が崩れたときは stderr に 1 回だけ理由を出して
-torch 実装（`_mod_scale_shift_ref`）に戻る。**黙って遅くなるフォールバックは禁止**
-（実際に一度、カーネル側のバグを隠した）。
+torch 実装（`_mod_scale_shift_ref`）に戻る。理由を出さないフォールバックは使わない
+（以前、カーネル側の不具合を隠した）。
 
 ---
 
 ## 4. ビルドとインストール
 
-### 4.1 サブモジュール（最重要）
+### 4.1 サブモジュール
 
 ```bash
 cd ~/comfy-kitchen
@@ -658,7 +656,7 @@ git submodule update --init --depth 1
 空のままビルドすると 2 つの事故が起きます。
 
 1. `flash_decode.cu` が `flash_attn` ヘッダを見つけられずビルドが途中で失敗する
-2. CMake が `COMFY_HAVE_CUTLASS` を無効化し、`cutlass_gemm_int8.cu` 等が **4KB のダミースタブ**としてコンパイルされる →「ビルドは成功するが遅い」という最悪の失敗
+2. CMake が `COMFY_HAVE_CUTLASS` を無効化し、`cutlass_gemm_int8.cu` 等が **4KB のダミースタブ**としてコンパイルされる → ビルドは成功するが遅い状態になる
 
 初期化前に一度ビルドしていた場合は `rm -rf build` で CMake キャッシュを捨ててください。
 
@@ -694,7 +692,7 @@ uv pip install torch triton        # ComfyUI と同じバージョンに合わ�
 
 - `COMFY_CUDA_ARCHS=121` で旧世代 arch を省略（20 コアで約 2.5 分）
 - `-e`（editable）なので `_C.abi3.so` はリポジトリ内に置かれ、以後 **Python の修正は再ビルド不要**
-- 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら §4.1 の罠）
+- 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら §4.1）
 - `uv pip install` は **activate 中の venv に入る**（`VIRTUAL_ENV` を見る）。空のまま実行すると
   別インタプリタに入って「import できない」になるので、`which python` で `.venv` を指しているか確認する
 - この venv に `pip` モジュールが無い構成でも `uv pip` は動く。`python -m pip` は使わない
@@ -847,7 +845,7 @@ git push --force-with-lease origin main     # rebase したので force
 | FP8 へ切り替え | **やらない** | レガシー経路では INT8 と同レート（105.6 vs 105.3 TOPS）。ビット一致も失う |
 | 活性量子化パスの融合 | **やらない** | 既に 226〜235 GB/s（ピーク 273 の 83〜86%）。融合すると A トラフィックが 2 倍になり逆効果 |
 | 大形状向け自動チューナ | **やらない** | 形状ごとに最適が入れ替わり（2048×5120 は stages=3、512×4096 は stages=4）利得 ±5%。測定コストが上回る |
-| `G`（L2 スウィズル）の削除 | **絶対にやらない** | 行優先順序にすると 176 → 105 TOPS（1.7 倍差）。このカーネルで最も効く部分 |
+| `G`（L2 スウィズル）の削除 | やらない | 行優先順序にすると 176 → 105 TOPS（1.7 倍差）。このカーネルで最も効く部分 |
 
 ---
 
@@ -860,7 +858,7 @@ git push --force-with-lease origin main     # rebase したので force
 | `Kernel requires a runtime memory allocation, but no allocator was set` | TMA 記述子を使う実験時のみ。`triton.set_allocator(...)` を設定 |
 | `stderr` に `Triton INT8 GEMM failed ... falling back to CUTLASS` | `_triton_int8_broken` が立ち、そのセッションは CUTLASS 固定。原因（多くは Python.h 不在や Triton のコンパイル失敗）を直してプロセス再起動 |
 | `Python.h` が見つからない | `_ensure_python_headers()` のフォールバック（`/opt/py312-include`、コンテナ用）。ホスト venv では `sysconfig` の include が使われる |
-| 数値が CUTLASS と一致しない | ランチャーの `BM/BN/BK/G/warps/stages` を定数のままにしている（§3.1 の罠）。ただし **N が16の倍数でない場合は上流 CUTLASS の方が壊れている**（§10.4）ので、厳密参照で判定する |
+| 数値が CUTLASS と一致しない | ランチャーの `BM/BN/BK/G/warps/stages` を定数のままにしている（§3.1）。ただし **N が16の倍数でない場合は上流 CUTLASS の方が壊れている**（§10.4）ので、厳密参照で判定する |
 | `expand()` したスケールで値が壊れる / OOB | ゲートが `is_contiguous()` を要求する。呼び出し側で `.contiguous()` するか、CUTLASS に落とす |
 | `torch.compile` で autograd エラー | `requires_grad` 付き入力は意図的に Python trace へ落とす（§10.1）。訓練で使うなら custom op に autograd 登録が必要 |
 
@@ -986,7 +984,7 @@ Claude Code（`--effort high`、Read のみ）と Antigravity（Gemini 4 Argon H
 - **`K==0` の挙動が CUTLASS と違う**（Triton は bias か 0 を書く、CUTLASS は何も書かない）。未初期化メモリを返さない分だけ安全側。
 - **`COMFY_KITCHEN_INT8_MODE` は呼び出しごとに読むが、`_DISABLE_CUTLASS_INT8` は import 時固定**（上流由来の非対称）。
 
-### 10.4 上流のバグを発見（重要）
+### 10.4 上流のバグ
 
 **`N` が 16 の倍数でない場合、上流 CUTLASS カーネルは壊れた出力を返す。** 実測（M=24, K=256, bf16）:
 
