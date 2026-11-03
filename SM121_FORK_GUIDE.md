@@ -77,7 +77,7 @@ M<40 は素と同じ CUTLASS に流す（Triton はランチャー固定費が�
 | SA3 へ切替 | 1.02x、cos 0.982（SA2 は 0.9992） | 不可 |
 | `num_ctas=2` / `warp_specialize` / persistent / BK 変更 | −10〜−110% | 不可 |
 | tcgen05（CUTLASS 書き直し） | cuBLAS FP8 が 178 TOPS ＝ 本カーネルと同等 | 不可 |
-| FP8 へ切替 | レガシー経路で INT8 と同レート、ビット一致も失う | 不可 |
+| FP8 へ切替 | カーネル単体で 1.03〜1.05x（H3 形状、`bench/bench_fp8_vs_int8.py`）。重みは同じ 1 byte/要素で帯域差なし。仮数は e4m3 の 3 bit になり、ビット一致も失う | 不可 |
 
 ### 0.5 再測定の仕方
 
