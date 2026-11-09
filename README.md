@@ -1,3 +1,9 @@
+> **GB10 (`sm_121`) fork — `gb10-optimized` branch.** Adds a Triton INT8 fused-dequant GEMM
+> path and a fused modulation kernel for DGX Spark / GB10, plus the ComfyUI hook that uses them.
+> Start here: [SM121_FORK_GUIDE.md](SM121_FORK_GUIDE.md) (Japanese index) ·
+> [SM121_FORK_GUIDE.en.md](SM121_FORK_GUIDE.en.md) (English index) — operations, design and
+> measurements are linked from both.
+
 # Comfy Kitchen
 
 Fast kernel library for Diffusion inference with multiple compute backends.
