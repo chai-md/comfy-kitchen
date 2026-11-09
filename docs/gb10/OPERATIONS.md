@@ -1,5 +1,7 @@
 # GB10 フォーク運用 — ビルド・検証・上流追従・障害対応
 
+English: [OPERATIONS.en.md](OPERATIONS.en.md)
+
 対象: `chai-md/comfy-kitchen` の `gb10-optimized` ブランチ。設計根拠は
 [DESIGN.md](DESIGN.md)、実測は [MEASUREMENTS.md](MEASUREMENTS.md) を参照。
 

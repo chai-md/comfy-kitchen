@@ -1,5 +1,7 @@
 # GB10 (`sm_121`) 向け `comfy-kitchen` フォーク — 索引
 
+English: [SM121_FORK_GUIDE.en.md](SM121_FORK_GUIDE.en.md)
+
 上流 `Comfy-Org/comfy-kitchen` のフォーク。GB10 (sm_121) 向けに **INT8 GEMM の Triton 経路**と
 **変調（scale/shift）の融合**を追加したもので、実体は `gb10-optimized` ブランチの7コミットです。
 この文書は用途別に4本へ分割しています（旧 `SM121_FORK_GUIDE.md` 1本を再編）。

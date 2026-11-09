@@ -1,5 +1,7 @@
 # GB10 フォーク実測リファレンス
 
+English: [MEASUREMENTS.en.md](MEASUREMENTS.en.md)
+
 測定環境: dgxspark1 / GB10 / 48 SM / 2190 MHz（上限 2418、実運用は 2200 cap）/ Triton 3.9.0 /
 torch 2.15.0+cu132（2026-10-30）。設計は [DESIGN.md](DESIGN.md)、手順は [OPERATIONS.md](OPERATIONS.md)。
 

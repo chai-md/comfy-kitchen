@@ -1,5 +1,7 @@
 # GB10 フォーク設計根拠 — 何をどう変えたか
 
+English: [DESIGN.en.md](DESIGN.en.md)
+
 対象: `chai-md/comfy-kitchen` の `gb10-optimized`（`main..gb10-optimized` の7コミット）。
 運用手順は [OPERATIONS.md](OPERATIONS.md)、数値は [MEASUREMENTS.md](MEASUREMENTS.md)。
 **コードはリポジトリが正**（本稿は全文を貼らず、判断理由と落とせない制約だけを残す）。
