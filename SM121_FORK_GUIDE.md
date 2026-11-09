@@ -104,9 +104,9 @@ python bench/bench_h3_breakdown.py vanilla
 | :--- | :--- |
 | フォーク | `chai-md/comfy-kitchen`（`origin`、HTTPS）。**default branch は `gb10-optimized`** |
 | 上流 | `Comfy-Org/comfy-kitchen`（`upstream`、`git fetch upstream` で追従） |
-| 作業ブランチ | **`gb10-optimized`**（16コミット＝パッチ15＋本指示書の更新。常に `main` の直上に rebase する） |
+| 作業ブランチ | **`gb10-optimized`**（7コミット＝パッチ系列5＋docs/bench 1＋版数1。常に `main` の直上に rebase する） |
 | `main` | **上流のミラー**（上流と同一コミットのみ）。直接コミットしない・checkout しない（下記） |
-| 変更の実体 | `git log --oneline main..origin/gb10-optimized` の 16 コミット（うち 11 は guide/bench/docs） |
+| 変更の実体 | `git log --oneline main..origin/gb10-optimized` の 7 コミット |
 | ローカル | このリポジトリ。ビルド/テストは直下の `.venv`（`source .venv/bin/activate`）、ComfyUI から使う場合は ComfyUI 側の venv にも editable で入れる（§4.2） |
 
 ```bash
@@ -127,7 +127,7 @@ git submodule update --init --depth 1   # 必須（§4.1）
 git fetch upstream && git branch -f main upstream/main && git push origin main
 ```
 
-履歴は 16 本（パッチ15＋本指示書の更新）。**ブランチ名ではなく範囲で追う**（`main..gb10-optimized` がフォークの実体）。
+履歴は 7 本（パッチ系列5＋docs/bench 1＋版数1）。**ブランチ名ではなく範囲で追う**（`main..gb10-optimized` がフォークの実体）。
 
 | コミット | 内容 |
 | :--- | :--- |
@@ -136,9 +136,12 @@ git fetch upstream && git branch -f main upstream/main && git push origin main
 | `b319605` | `scale_shift`: 非連続な変調ビューを `.contiguous()` 化、カバレッジ検証を追加 |
 | `2ce8f0d` | ComfyUI 側フックを `patches/comfyui-minimax-modulation.patch` として同梱 |
 | `0f83d79` | 本指示書の比較基準を素の comfy-kitchen に修正、Triton ゲートを 40 へ、計測スクリプト `bench/` を同梱 |
-| `2782b6c`..`b096faf` | guide / bench / docs の推敲 10 本（コード差分なし） |
+| `e0aa594` | guide / bench / docs の集約1本（旧11本を squash。元メッセージ全文は commit body に保存） |
+| 先頭 | `pyproject.toml` の版数を `0.2.41+gb10.1` に（上流版との取り違え防止） |
 
-このほか、ブランチ運用（`main` を上流ミラー化）を反映した本指示書の更新が先頭に 1 本。合計 16 本。
+合計 7 本。版数の `+gb10.1` は PEP 440 のローカル版数で、既定ブランチから
+`pip install git+https://github.com/chai-md/comfy-kitchen` した場合にこの値になる。既存の editable 環境は
+再インストールするまで dist-info が `0.2.41` のまま（import 先は変わらないので動作に影響はない）。
 
 > 注: rebase のたびに SHA は書き換わる。上の SHA は 2026-11-09 時点。**範囲と内容で追う**こと。
 
@@ -836,7 +839,7 @@ python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
 cd /home/chai/comfy-kitchen
 git fetch upstream
 git switch gb10-optimized                   # main は checkout しない（§1）
-git rebase upstream/main                    # パッチ列（16本）を上流 tip に載せ替え
+git rebase upstream/main                    # パッチ列（7本）を上流 tip に載せ替え
 git submodule update --init --depth 1
 
 source .venv/bin/activate                   # §4.2 の venv
