@@ -3,55 +3,98 @@
 上流 `Comfy-Org/comfy-kitchen` をフォークし、**GB10 (sm_121) 用の INT8 GEMM 最適化を再適用**するための手順書です。上流の新リリースに追従するたびに、この文書の §3→§5 を繰り返せば同じ状態に戻せます。
 
 - 対象機: dgxspark1（GB10 / 48 SM / 2190 MHz、クロック上限 2200）
-- 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、Python venv = `/home/chai/ComfyUI/.venv`
-- ベース: `comfy-kitchen` v0.2.40、コミット `cdab478`
+- 前提: CUDA 13.x、Python 3.13、`torch 2.15+cu132`、**作業は `source .venv/bin/activate` した venv の中で行う**（§4.2）
+- ベース: `comfy-kitchen` v0.2.40（`cdab478`）から開始し、現在は v0.2.41（`7d6a22a`）の直上に rebase 済み
 - 変更は **Python のみ**（CUDA/C++ の変更なし。`_C.abi3.so` は再ビルドで作り直すが、差分は無い）
+- 参考: [kanthai/gb10-comfyui-tuning](https://github.com/kanthai/gb10-comfyui-tuning)（謝辞は §11）
 
 ---
 
-## 0. 何が速くなるか（先に期待値を合わせる）
+## 0. 何が効くのか（結論から）
 
-**比較元は素の comfy-kitchen（上流 `cdab478` の CUTLASS 経路）。** 同一スクリプトを
-2 状態（`switch_kernel_state.sh A` / `main`）で実行して取得した実測値。測定は
-`int8_linear` のエンドツーエンド（活性量子化込み）、N=K=4096、min-of-5、dgxspark1。
+H3 の実測（M=15,787）では、1 イテレーションがこう変わる。数値はすべて**素の
+comfy-kitchen（上流 `cdab478`）**との比較で、同一スクリプトを 2 状態（`switch_kernel_state.sh A`
+と `gb10-optimized`）で流して取得（`bench/bench_h3_breakdown.py`）。
 
-| M | 素の comfy-kitchen | 本フォーク | 倍率 | フォークの経路 |
-| ---: | ---: | ---: | ---: | :--- |
-| 16 | 31.5 µs | 32.9 µs | 0.96x | CUTLASS（M<40 は素と同じ） |
-| 24 | 32.1 | 33.1 | 0.97x | CUTLASS |
-| 32 | 33.5 | 32.7 | 1.02x | CUTLASS |
-| 40 | 43.0 | 40.7 | 1.06x | Triton |
-| 48 | 43.2 | 40.9 | 1.06x | Triton |
-| 56 | 64.3 | 40.8 | **1.58x** | Triton |
-| 64 | 88.3 | 40.4 | **2.18x** | Triton |
-| 96 | 88.1 | 50.1 | **1.76x** | Triton |
-| 128 | 91.7 | 54.3 | **1.69x** | Triton |
-| 512 | 230.3 | 141.5 | **1.63x** | Triton |
-| 1024 | 289.7 | 304.0 | 0.95x | Triton（誤差圏） |
-| 4096 | 1082.8 | 1079.6 | 1.00x | Triton |
-| 2048×5120×5120 | 780.6 | 793.1 | 0.98x | Triton |
+| 段階 | 素 | 本フォーク | 短縮 | 変更元 |
+| :--- | ---: | ---: | ---: | :--- |
+| INT8 GEMM（4線形 × 50層） | 7.87 s | 3.82 s | **−4.05 s** | 本フォークの Triton 経路 |
+| 変調 `scale/shift`（×100） | 0.49 s | 0.16 s | **−0.33 s** | `tensor/scale_shift.py` |
+| 回転＋量子化（×200） | 0.32 s | 0.32 s | 0 | 変更なし（帯域天井、§7） |
+| attention（×50） | 2.69 s | 2.69 s | 0 | フォーク外（起動フラグ、下記） |
+| **合計** | **11.4 s** | **7.0 s** | **−4.4 s（1.63x）** | |
 
-読み方:
+効果があるのは **INT8 GEMM と 変調**。attention はフォーク起因ではなく、ComfyUI の起動フラグ
+`--use-sage-attention` による（SA2 53.9 ms/層、SDPA だと 96.6 ms/層でこの段階が 2.69 → 4.86 s）。
 
-- **効くのは M=56〜512 の細い帯**（1.6〜2.2 倍）。重みが L2 に載る形状。
-- **大形状は同等**（±5%）。素の CUTLASS 経路でも 127〜138 TOPS 出ており、機械の実用天井に
-  既に近い。ここを伸ばす余地はない。
-- **M<40 は素と同じ CUTLASS**。Triton はランチャー固定費が高いため、M=24〜32 では
-  むしろ 20% 遅かった（実測 0.78〜0.82x）。ゲートは 40 が下限（§3.2 の `_TRITON_INT8_MIN_M`）。
-- **CPU 固定費はフォークの方が高い**: 31.3 → 39.6 µs/呼び出し（Triton ランチャーの Python 側）。
-  GEMM が 150 µs 以上ある帯では無視できるが、細い M では効くので CUTLASS に残している。
-  なおフォーク内部のヘッダ存在チェックのメモ化自体は 66.4 → 13.3 µs の改善（その部分のみ）。
-- **DiT 変調（`scale/shift`）は 2〜3 倍**（M=27280/K=5376 で 8092 → 2721 µs）。
-  `tensor/scale_shift.py` + §4.3 のフックを入れた場合のみ。
+### 0.1 レバーと効く条件
 
-測定スクリプトはリポジトリ同梱: `bench/bench_int8_baseline.py`（形状別）と
-`bench/bench_thin_m.py`（M=16〜128 のクロスオーバー）。再測定は
+| # | レバー | 効く条件 | 大きさ | 効かない条件 |
+| :--- | :--- | :--- | ---: | :--- |
+| 1 | INT8 GEMM を Triton 経路へ | **N が広い**射影層（N ≳ 8192） | 1.5–2.4x | N ≤ 4096 では 1.05x |
+| 2 | 変調の融合（`scale_shift`） | DiT の pre-norm 変調がある | 3.0x（その段階） | 変調の無いモデル |
+| 3 | attention を SageAttention | ComfyUI の起動フラグ（コード変更なし） | 1.8x（その段階） | SA3 は 1.02x で不可 |
+
+### 0.2 GEMM の効き目は M ではなく N で決まる
+
+M=15,787 固定・K=5,376:
+
+| N | 素 comfy-kitchen | 本フォーク | 倍率 |
+| ---: | ---: | ---: | ---: |
+| 4096（K=4096） | 4.45 ms / 119 TOPS | 4.21 ms / 126 TOPS | 1.06x |
+| 8192 | 22.24 ms / 62.5 TOPS | 9.38 ms / 148 TOPS | **2.37x** |
+| 10752 | 24.44 ms / 74.7 TOPS | 11.88 ms / 154 TOPS | **2.06x** |
+| 21504（H3 qkv） | 50.25 ms / 72.6 TOPS | 22.50 ms / 162 TOPS | **2.23x** |
+| 28672（H3 fc1） | 69.06 ms / 70.5 TOPS | 29.21 ms / 167 TOPS | **2.36x** |
+
+素の CUTLASS は N が広がると 119 → 62〜75 TOPS に低下し、Triton 側は 126 → 148〜167 に上がる。
+射影層は N = hidden / 3·hidden / 2·ffn なのでこの帯に入る。
+
+### 0.3 細い M は別レバー（同じカーネルのタイル表）
+
+N=K=4,096（重み 16MB = L2 圏）で M を振った場合:
+
+| M | 素 | 本フォーク | 倍率 |
+| ---: | ---: | ---: | ---: |
+| 24 | 32.1 µs | 33.1 | 0.97x（両方 CUTLASS） |
+| 40 | 43.0 | 40.7 | 1.06x |
+| 56 | 64.3 | 40.8 | **1.58x** |
+| 64 | 88.3 | 40.4 | **2.18x** |
+| 128 | 91.7 | 54.3 | **1.69x** |
+| 512 | 230.3 | 141.5 | **1.63x** |
+| 1024 | 289.7 | 304.0 | 0.95x（誤差圏） |
+| 4096 | 1082.8 | 1079.6 | 1.00x |
+
+M<40 は素と同じ CUTLASS に流す（Triton はランチャー固定費が高く M=24〜32 では 0.78〜0.82x と
+負ける）。しきい値は `_TRITON_INT8_MIN_M = 40`。
+
+### 0.4 効かないと確認済み（再試行しない）
+
+| 案 | 実測 | 判定 |
+| :--- | :--- | :--- |
+| 回転（256グループ Hadamard）の自前カーネル | 0.91x（cuBLAS が既に 228 GB/s の帯域天井） | 不可 |
+| 量子化パスの融合 | 既に 226〜235 GB/s（ピークの 83〜86%） | 不可 |
+| SA3 へ切替 | 1.02x、cos 0.982（SA2 は 0.9992） | 不可 |
+| `num_ctas=2` / `warp_specialize` / persistent / BK 変更 | −10〜−110% | 不可 |
+| tcgen05（CUTLASS 書き直し） | cuBLAS FP8 が 178 TOPS ＝ 本カーネルと同等 | 不可 |
+| VAE デコードを GPU バッファ + 一括コピーに | 103 フレーム (768×1344) で 23.39 → 23.52 s（差なし）。ページング罠自体は再現する（1.28GB の未タッチ領域への書き込み 10.1 s → `zero_()` 後 0.03 s）が、この VAE のチャンクコピーでは発生しない | 不要 |
+| FP8 へ切替 | カーネル単体で 1.03〜1.05x（H3 形状、`bench/bench_fp8_vs_int8.py`）。重みは同じ 1 byte/要素で帯域差なし。仮数は e4m3 の 3 bit になり、ビット一致も失う | 不可 |
+
+### 0.5 再測定の仕方
 
 ```bash
-python bench/bench_int8_baseline.py fork     # 現在の状態
-# switch_kernel_state.sh A で素に戻して
-python bench/bench_int8_baseline.py vanilla
+cd ~/comfy-kitchen && source .venv/bin/activate
+
+python bench/bench_h3_breakdown.py fork     # H3 の内訳（GEMM/変調/回転/attention）
+python bench/bench_int8_baseline.py fork    # 形状別 int8_linear
+python bench/bench_thin_m.py fork           # M=16〜128 のクロスオーバー
+
+~/archive/patches/switch_kernel_state.sh A  # 素に戻す
+python bench/bench_h3_breakdown.py vanilla
 ```
+
+測定の作法: 同一構成でも実行間で 10〜15% 揺れる。min-of-3〜5、構成はラウンドロビン、
+10% 未満の差は有意とみなさない。
 
 ---
 
@@ -59,36 +102,53 @@ python bench/bench_int8_baseline.py vanilla
 
 | 項目 | 実態 |
 | :--- | :--- |
-| フォーク | `chai-md/comfy-kitchen`（`origin`、HTTPS） |
-| 上流 | `Comfy-Org/comfy-kitchen`（`upstream`） |
-| 作業ブランチ | **`main`**（トピックブランチは切っていない。コミットは上流 `cdab478` の直上に載る） |
-| 変更の実体 | `git log --oneline cdab478..origin/main` の 4 コミット（下記） |
-| ローカル | `/home/chai/comfy-kitchen`、`ComfyUI/.venv` から editable で参照 |
+| フォーク | `chai-md/comfy-kitchen`（`origin`、HTTPS）。**default branch は `gb10-optimized`** |
+| 上流 | `Comfy-Org/comfy-kitchen`（`upstream`、`git fetch upstream` で追従） |
+| 作業ブランチ | **`gb10-optimized`**（16コミット＝パッチ15＋本指示書の更新。常に `main` の直上に rebase する） |
+| `main` | **上流のミラー**（上流と同一コミットのみ）。直接コミットしない・checkout しない（下記） |
+| 変更の実体 | `git log --oneline main..origin/gb10-optimized` の 16 コミット（うち 11 は guide/bench/docs） |
+| ローカル | このリポジトリ。ビルド/テストは直下の `.venv`（`source .venv/bin/activate`）、ComfyUI から使う場合は ComfyUI 側の venv にも editable で入れる（§4.2） |
 
 ```bash
 # フォーク作成 + clone（初回のみ）
 gh repo fork Comfy-Org/comfy-kitchen --clone
 cd comfy-kitchen
 git remote add upstream https://github.com/Comfy-Org/comfy-kitchen.git
-git switch main                     # フォークの main がそのまま作業ブランチ
-git submodule update --init --depth 1   # 必須（§4.1 の罠）
+git fetch upstream
+git switch -c gb10-optimized --track origin/gb10-optimized   # 既存フォークから引く場合
+git submodule update --init --depth 1   # 必須（§4.1）
 ```
 
-履歴はこの 4 つ。**ブランチ名で探さず、この範囲で追う**（フォークの `main` が最新）。
+**`main` は checkout しない。** `~/comfy-kitchen` は ComfyUI の venv に editable で入っているので、
+このクローンで `main` に切り替えた瞬間に ComfyUI が素のカーネルで動き出す（しかも無言で）。
+ミラーの更新は checkout を伴わないこの形で行う:
+
+```bash
+git fetch upstream && git branch -f main upstream/main && git push origin main
+```
+
+履歴は 16 本（パッチ15＋本指示書の更新）。**ブランチ名ではなく範囲で追う**（`main..gb10-optimized` がフォークの実体）。
 
 | コミット | 内容 |
 | :--- | :--- |
-| `3fba74f` | Triton INT8 融合 GEMM＋タイル表＋ディスパッチ＋residual 融合＋`tensor/scale_shift.py` 初版＋テスト |
-| `fdc854d` | `scale_shift`: 変調テンソルを活性 dtype に丸める（fp32 adaLN 対応。これが無いと H3 の絵が変わる） |
-| `33e16e8` | `scale_shift`: 非連続な変調ビューを `.contiguous()` 化、カバレッジ検証を追加 |
-| `3dc2406` | ComfyUI 側フックを `patches/comfyui-minimax-modulation.patch` として同梱 |
+| `f5d2558` | Triton INT8 融合 GEMM＋タイル表＋ディスパッチ＋residual 融合＋`tensor/scale_shift.py` 初版＋テスト |
+| `dfcd33d` | `scale_shift`: 変調テンソルを活性 dtype に丸める（fp32 adaLN 対応。これが無いと H3 の絵が変わる） |
+| `b319605` | `scale_shift`: 非連続な変調ビューを `.contiguous()` 化、カバレッジ検証を追加 |
+| `2ce8f0d` | ComfyUI 側フックを `patches/comfyui-minimax-modulation.patch` として同梱 |
+| `0f83d79` | 本指示書の比較基準を素の comfy-kitchen に修正、Triton ゲートを 40 へ、計測スクリプト `bench/` を同梱 |
+| `2782b6c`..`b096faf` | guide / bench / docs の推敲 10 本（コード差分なし） |
+
+このほか、ブランチ運用（`main` を上流ミラー化）を反映した本指示書の更新が先頭に 1 本。合計 16 本。
+
+> 注: rebase のたびに SHA は書き換わる。上の SHA は 2026-11-09 時点。**範囲と内容で追う**こと。
 
 ```bash
 # 同じ状態を別マシンで再現する場合
-git fetch origin && git switch main && git reset --hard origin/main
+git fetch origin && git switch gb10-optimized && git reset --hard origin/gb10-optimized
 ```
 
-`sm121_optimize.patch` は `git diff` のスナップショットで**追跡していない**（コミットが正）。必要なら `git diff cdab478..HEAD -- comfy_kitchen tests > sm121_optimize.patch` で作り直せます。
+`sm121_optimize.patch` は `git diff` のスナップショットで、**リポジトリには置かない**（`~/archive/patches/`）。
+必要なら `git diff main..gb10-optimized -- comfy_kitchen tests > ~/archive/patches/sm121_optimize.patch`。
 
 ---
 
@@ -358,7 +418,8 @@ def triton_int8_gemm_dequant(
 
 ランチャー側は `triton_int8_gemm_dequant(..., residual=..., residual_scale=...)` を受け、`residual is None` のときはダミーポインタ（`out`）を渡して `HAS_RESIDUAL=False` にします。ディスパッチ側は `_cutlass_int8_dequant(..., residual=, residual_scale=)` に統合し、Triton が使えないときだけ `_C.cutlass_int8_dequant_residual` に落とします。
 
-> **再発しやすい罠**: ランチャーの `BM=BN=BK=G=num_warps=num_stages` は必ず変数で渡すこと。ここを定数のまま残すと、グリッドだけタイル選択に従って**結果が壊れます**（§5 の bit-identical 検査で即座に検出できます）。
+> **注意**: ランチャーの `BM=BN=BK=G=num_warps=num_stages` は変数で渡すこと。定数のままだと
+> グリッドだけがタイル選択に従い、**結果が壊れます**（§5 の bit-identical 検査で検出できます）。
 
 ### 3.2 `comfy_kitchen/backends/cuda/__init__.py`
 
@@ -575,7 +636,7 @@ out-of-place で 222 GB/s、実測 **2〜3 倍**。
    fp16 は指数部が 5 bit で subnormal 域の丸めが変わるため `cvt.rn.f16.f32` を使う。
 2. **変調テンソルは先に活性の dtype へ丸める**（`_mod_row` の `.to(h.dtype)`）。
    H3 の curve チェックポイントは adaLN を fp32 で持つので、これを飛ばすと 38% の要素が
-   ずれる（bf16 変調だけ見ていると気付けない）。
+   ずれる（bf16 変調では再現しない）。
 3. **`scale`/`shift` は非連続ビューで来る。** ComfyUI は `[R, n*cols]` から
    `[R, cols]` を切り出すため行ストライドが `n*cols`。`row*cols` で索引すると
    mod 行 0 以外が全部ずれる（実測: 15787 行中 802 行が不一致）。呼び出し前に
@@ -595,14 +656,14 @@ mod 行テンソルにも対応する。
 ComfyUI は上流クローンなので、フックは `patches/comfyui-minimax-modulation.patch`
 として本リポジトリに同梱している（適用は §4.3）。`_mod_scale_shift()` が
 comfy-kitchen のカーネルを使い、前提が崩れたときは stderr に 1 回だけ理由を出して
-torch 実装（`_mod_scale_shift_ref`）に戻る。**黙って遅くなるフォールバックは禁止**
-（実際に一度、カーネル側のバグを隠した）。
+torch 実装（`_mod_scale_shift_ref`）に戻る。理由を出さないフォールバックは使わない
+（以前、カーネル側の不具合を隠した）。
 
 ---
 
 ## 4. ビルドとインストール
 
-### 4.1 サブモジュール（最重要）
+### 4.1 サブモジュール
 
 ```bash
 cd ~/comfy-kitchen
@@ -612,38 +673,61 @@ git submodule update --init --depth 1
 空のままビルドすると 2 つの事故が起きます。
 
 1. `flash_decode.cu` が `flash_attn` ヘッダを見つけられずビルドが途中で失敗する
-2. CMake が `COMFY_HAVE_CUTLASS` を無効化し、`cutlass_gemm_int8.cu` 等が **4KB のダミースタブ**としてコンパイルされる →「ビルドは成功するが遅い」という最悪の失敗
+2. CMake が `COMFY_HAVE_CUTLASS` を無効化し、`cutlass_gemm_int8.cu` 等が **4KB のダミースタブ**としてコンパイルされる → ビルドは成功するが遅い状態になる
 
 初期化前に一度ビルドしていた場合は `rm -rf build` で CMake キャッシュを捨ててください。
 
 ### 4.2 ビルド（editable）
 
-`uv pip install` は環境変数頼みだと別インタプリタに入ることがあるので、
-**`--python` で venv を明示する**（この形が実機で通っている）。
+**仮想環境は `source .venv/bin/activate` を前提にする。** ノードごとにパスが違うので、
+`/home/chai/ComfyUI/.venv` のような絶対パスを手順に埋めない（他ノードで必ず失敗する）。
+
+前提: その venv に **torch（2.15+cu132）と triton（3.9）が入っていること**。
+`--no-build-isolation` はビルドに既存の torch を使うため、空の venv では失敗する。
+ComfyUI が動いているノードなら、その ComfyUI の venv を使うのが最短。
 
 ```bash
-cd /home/chai/comfy-kitchen
+cd ~/comfy-kitchen                 # ノードごとのリポジトリ位置
 
-# 不足時のみ
-/home/chai/ComfyUI/.venv/bin/uv pip install --python /home/chai/ComfyUI/.venv/bin/python \
-    nanobind packaging wheel cmake ninja
+# リポジトリ直下に .venv がある場合
+source .venv/bin/activate
+# 無い場合は、そのノードの ComfyUI の venv を使う（torch/triton が揃っている）
+#   source ~/ComfyUI/.venv/bin/activate
 
-COMFY_CUDA_ARCHS=121 /home/chai/ComfyUI/.venv/bin/uv pip install \
-    --python /home/chai/ComfyUI/.venv/bin/python \
-    --no-build-isolation -e .
+which python                      # venv を指していることを確認
+uv pip install nanobind packaging wheel cmake ninja   # 不足時のみ
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+```
+
+まっさらな venv から始める場合だけ、先に依存を入れる（数 GB・数分）。
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -U uv
+uv pip install torch triton        # ComfyUI と同じバージョンに合わせる
 ```
 
 - `COMFY_CUDA_ARCHS=121` で旧世代 arch を省略（20 コアで約 2.5 分）
 - `-e`（editable）なので `_C.abi3.so` はリポジトリ内に置かれ、以後 **Python の修正は再ビルド不要**
-- 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら §4.1 の罠）
-- venv を activate 済みなら `--python` は省略可。`python -m pip` は venv に pip が無いため使わない
+- 確認: `ls -l comfy_kitchen/backends/cuda/_C.abi3.so` が 12MB 級であること（4KB なら §4.1）
+- `uv pip install` は **activate 中の venv に入る**（`VIRTUAL_ENV` を見る）。空のまま実行すると
+  別インタプリタに入って「import できない」になるので、`which python` で `.venv` を指しているか確認する
+- この venv に `pip` モジュールが無い構成でも `uv pip` は動く。`python -m pip` は使わない
 
-ComfyUI から見た向き先の確認:
+#### ComfyUI から使う場合
+
+editable は **venv ごと**に入る。検証だけなら上の `.venv` で足りるが、ComfyUI に読ませるなら
+そのノードの ComfyUI の venv を activate して同じコマンドを流す（`--python` を足すより事故が少ない）。
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "import comfy_kitchen, pathlib; print(pathlib.Path(comfy_kitchen.__file__).parent)"
-# → /home/chai/comfy-kitchen/comfy_kitchen なら editable が効いている
+source ~/ComfyUI/.venv/bin/activate      # ノードごとのパス
+cd ~/comfy-kitchen
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+python -c "import comfy_kitchen, pathlib; print(pathlib.Path(comfy_kitchen.__file__).parent)"
+# → <repo>/comfy_kitchen なら editable が効いている
 ```
+
+再ビルド不要なのは Python 側だけ。**C++/CUDA（`_C.abi3.so`）を触ったら両方の venv で再ビルド**する。
 
 ### 4.3 ComfyUI 側フックの適用
 
@@ -651,10 +735,10 @@ ComfyUI は上流（`Comfy-Org/ComfyUI`）クローンなので push 先が無�
 `patches/comfyui-minimax-modulation.patch` を適用して使う。
 
 ```bash
-git -C /home/chai/ComfyUI apply /home/chai/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 
 # 取り消し（上流に戻す）
-git -C /home/chai/ComfyUI apply -R /home/chai/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+git -C ~/ComfyUI apply -R ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 
 # 上流を pull した後は再適用（競合したら model.py の _mod_scale_shift だけ手で直す）
 ```
@@ -664,7 +748,7 @@ git -C /home/chai/ComfyUI apply -R /home/chai/comfy-kitchen/patches/comfyui-mini
 ### 4.4 インストール直後の動作確認
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 import torch
 from comfy_kitchen.backends import cuda as cb
 import comfy_kitchen.tensor.scale_shift as ss
@@ -687,7 +771,7 @@ print('scale_shift bit-identical:', torch.equal(out, ref))
 ### 5.1 ディスパッチとビット一致
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 import torch, comfy_kitchen
 from comfy_kitchen.backends import cuda as cb
 from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
@@ -718,7 +802,7 @@ for m in (24, 64, 96, 160, 192, 256, 512):
 ### 5.2 タイル表
 
 ```bash
-/home/chai/ComfyUI/.venv/bin/python -c "
+python -c "
 from comfy_kitchen.backends.triton.quantization import _int8_tile_config as f
 for m in (24, 64, 127, 128, 207, 208, 287, 288, 4096):
     print(m, f(m, 4096, 4096)[:2], '|', m, f(m, 5120, 5120)[:2])
@@ -730,8 +814,8 @@ for m in (24, 64, 127, 128, 207, 208, 287, 288, 4096):
 ### 5.3 単体テスト
 
 ```bash
-uv pip install --python /home/chai/ComfyUI/.venv/bin/python pytest   # 未導入なら
-/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
+uv pip install pytest        # 未導入なら
+python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
 ```
 
 期待値: 全件パス（本リポジトリでは `290 passed` = 上流 + 追加 96 ケース）。
@@ -746,28 +830,33 @@ uv pip install --python /home/chai/ComfyUI/.venv/bin/python pytest   # 未導入
 
 ## 6. 上流追従
 
-作業ブランチは `main`（§1）。上流の新リリースに載せ替えるときはこの順で。
+作業ブランチは `gb10-optimized`（§1）。上流の新リリースに載せ替えるときはこの順で。
 
 ```bash
 cd /home/chai/comfy-kitchen
 git fetch upstream
-git rebase upstream/main                    # 上流のデフォルトブランチに合わせる
+git switch gb10-optimized                   # main は checkout しない（§1）
+git rebase upstream/main                    # パッチ列（16本）を上流 tip に載せ替え
 git submodule update --init --depth 1
 
-COMFY_CUDA_ARCHS=121 /home/chai/ComfyUI/.venv/bin/uv pip install \
-    --python /home/chai/ComfyUI/.venv/bin/python \
-    --no-build-isolation -e .
+source .venv/bin/activate                   # §4.2 の venv
+COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
+python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
+git push --force-with-lease origin gb10-optimized
 
-/home/chai/ComfyUI/.venv/bin/python -m pytest tests/test_int8.py tests/test_scale_shift.py -q
-git push --force-with-lease origin main     # rebase したので force
+# main ミラーを上流へ（fast-forward。checkout 不要）
+git branch -f main upstream/main && git push origin main
 ```
+
+- GitHub の "Sync fork" は **`main` を開いている時だけ**押す（`gb10-optimized` には上流の同名ブランチが無いので出ない）。`gh repo sync` も既定ブランチを見るため、使うなら `gh repo sync chai-md/comfy-kitchen -b main` と明示する。
+- 同期点にタグを打つなら `gb10-0.2.41-1` のように **`v` prefix を避ける**（fork の `build-wheels.yml` が `tags: v*` で全ターゲットのホイールビルドを起動する）。
 
 - コンフリクトしやすいのは **(1) `_cutlass_int8_dequant()` の 3 呼び出し箇所**、**(2) triton 側 `int8_linear()` の末尾**、**(3) `__init__.py` の `int8_linear()` 冒頭**。
 - 上流が同等機能（sm_121 判定や融合カーネル）を入れた場合は、**自分のゲートを捨てて上流に従う**。二重ディスパッチは事故のもと。
 - 追従後は §5 を必ず再実行（特に 5.1 のビット一致。上流が epilogue の演算順序を変えたら一致しなくなる）。
 - フォークを ComfyUI から使う場合、`pip install` の向き先が fork のパスであることを確認（§4.2 の確認コマンド）。
 - 上流が `_TRITON_INT8_MIN_M` の帯域やタイル表に触れたら、§0 の比較表を取り直す
-  （`~/archive/patches/bench_int8_baseline.py` を A / main の 2 状態で流すだけ）。
+  （`~/archive/patches/bench_int8_baseline.py` を A / `gb10-optimized` の 2 状態で流すだけ）。
 - ComfyUI 側は `git pull` でフックが外れるので、§4.3 のパッチを再適用する。
 
 ---
@@ -780,7 +869,7 @@ git push --force-with-lease origin main     # rebase したので force
 | FP8 へ切り替え | **やらない** | レガシー経路では INT8 と同レート（105.6 vs 105.3 TOPS）。ビット一致も失う |
 | 活性量子化パスの融合 | **やらない** | 既に 226〜235 GB/s（ピーク 273 の 83〜86%）。融合すると A トラフィックが 2 倍になり逆効果 |
 | 大形状向け自動チューナ | **やらない** | 形状ごとに最適が入れ替わり（2048×5120 は stages=3、512×4096 は stages=4）利得 ±5%。測定コストが上回る |
-| `G`（L2 スウィズル）の削除 | **絶対にやらない** | 行優先順序にすると 176 → 105 TOPS（1.7 倍差）。このカーネルで最も効く部分 |
+| `G`（L2 スウィズル）の削除 | やらない | 行優先順序にすると 176 → 105 TOPS（1.7 倍差）。このカーネルで最も効く部分 |
 
 ---
 
@@ -793,7 +882,7 @@ git push --force-with-lease origin main     # rebase したので force
 | `Kernel requires a runtime memory allocation, but no allocator was set` | TMA 記述子を使う実験時のみ。`triton.set_allocator(...)` を設定 |
 | `stderr` に `Triton INT8 GEMM failed ... falling back to CUTLASS` | `_triton_int8_broken` が立ち、そのセッションは CUTLASS 固定。原因（多くは Python.h 不在や Triton のコンパイル失敗）を直してプロセス再起動 |
 | `Python.h` が見つからない | `_ensure_python_headers()` のフォールバック（`/opt/py312-include`、コンテナ用）。ホスト venv では `sysconfig` の include が使われる |
-| 数値が CUTLASS と一致しない | ランチャーの `BM/BN/BK/G/warps/stages` を定数のままにしている（§3.1 の罠）。ただし **N が16の倍数でない場合は上流 CUTLASS の方が壊れている**（§10.4）ので、厳密参照で判定する |
+| 数値が CUTLASS と一致しない | ランチャーの `BM/BN/BK/G/warps/stages` を定数のままにしている（§3.1）。ただし **N が16の倍数でない場合は上流 CUTLASS の方が壊れている**（§10.4）ので、厳密参照で判定する |
 | `expand()` したスケールで値が壊れる / OOB | ゲートが `is_contiguous()` を要求する。呼び出し側で `.contiguous()` するか、CUTLASS に落とす |
 | `torch.compile` で autograd エラー | `requires_grad` 付き入力は意図的に Python trace へ落とす（§10.1）。訓練で使うなら custom op に autograd 登録が必要 |
 
@@ -808,18 +897,20 @@ git push --force-with-lease origin main     # rebase したので force
 
 ### 9.1 実用天井
 
-| 経路 | 2048×5120×5120 | 4096³ |
-| :--- | ---: | ---: |
-| 本カーネル INT8 | **176.5 TOPS** | 177.5 |
-| CUTLASS INT8 | 137–181 | 137 |
-| cuBLAS INT8 | 133 | 140 |
-| cuBLAS FP8 | **178** | 162 |
-| cuBLAS BF16 | 84 TFLOPS | 91 |
+| 経路 | 2048×5120×5120 | 4096³ | 15787×21504×5376（H3 qkv） |
+| :--- | ---: | ---: | ---: |
+| 本カーネル INT8 | **176.5 TOPS** | 177.5 | **164.1** |
+| CUTLASS INT8（素） | 137–181 | 137 | **72.1** |
+| cuBLAS INT8 | 133 | 140 | — |
+| cuBLAS FP8 | **178** | 162 | — |
+| cuBLAS BF16 | 84 TFLOPS | 91 | — |
+
+N が大きく重みが L2 を外れる形（H3 の qkv: 115MB）では素の CUTLASS が失速し、差が最も開く。
 
 レガシー IMMA の理論天井 = 48 SM × 2.19 GHz × 1024 MAC/cycle ≈ **215 TOPS**（達成率 82%）。cuBLAS 最速が 178 である以上、ライブラリ置換の余地はない。
 
-注意: これは **GEMM 単体**の比較。エンドツーエンド（量子化込み）では大形状で素と同じ
-127〜138 TOPS になり、差は出ない（§0）。
+注意: これは **GEMM 単体**の比較。エンドツーエンド（量子化込み）の差は **N の広さ**で決まり、
+N=4096 ではほぼ差が出ない（1.06x）が、N ≥ 8192 の射影層では 1.5〜2.4x 開く（§0.2）。
 
 ### 9.2 形状別（GEMM 単体、N=K=4096、本フォーク）
 
@@ -917,7 +1008,7 @@ Claude Code（`--effort high`、Read のみ）と Antigravity（Gemini 4 Argon H
 - **`K==0` の挙動が CUTLASS と違う**（Triton は bias か 0 を書く、CUTLASS は何も書かない）。未初期化メモリを返さない分だけ安全側。
 - **`COMFY_KITCHEN_INT8_MODE` は呼び出しごとに読むが、`_DISABLE_CUTLASS_INT8` は import 時固定**（上流由来の非対称）。
 
-### 10.4 上流のバグを発見（重要）
+### 10.4 上流のバグ
 
 **`N` が 16 の倍数でない場合、上流 CUTLASS カーネルは壊れた出力を返す。** 実測（M=24, K=256, bf16）:
 
@@ -943,3 +1034,36 @@ Claude Code（`--effort high`、Read のみ）と Antigravity（Gemini 4 Argon H
 | `_aligned16(resid_2d)` と `residual_scale.is_contiguous()` は CUTLASS の制約なのに Triton 経路まで CUTLASS に落としている | アラインメント検査を CUTLASS 分岐へ移動（非整列は `return False`）、rscale はランチャで `.contiguous()` |
 
 テストは scalar `residual_scale` / scalar `weight_scale` / `-0.0` / CPU スケールの4ケースを追加（合計 **263 passed**）。
+
+---
+
+## 11. 謝辞 / Acknowledgements
+
+本フォークの方向づけと運用の慣習は、次の公開ノートに負っています。
+
+### kanthai / gb10-comfyui-tuning（MIT）
+
+<https://github.com/kanthai/gb10-comfyui-tuning>
+
+DGX Spark (GB10) 上で ComfyUI + comfy-kitchen を実測したノートとパッチ集。とくに参照した点:
+
+| 参照した内容 | 本フォークでの対応 |
+| :--- | :--- |
+| `docs/02-int8-triton-gemm.md` — comfy-kitchen の CUTLASS 経路は sm_121 でピークの 37%、Triton の融合 dequant GEMM なら 88% | 本フォークの出発点。§0 の「N が広い射影層で 1.5〜2.4 倍」は同じ現象を shape 別に測り直したもの |
+| `docs/03-torch-compile-int8.md` — `torch.compile` 下で INT8 が落ちる原因 | `int8_linear()` の `torch.compiler.is_compiling()` 早期リターン（§3.3） |
+| モード切替の慣習 `COMFY_KITCHEN_INT8_MODE` / `/etc/comfy-kitchen-int8.mode`（`off` で素に戻す） | `_read_int8_mode()` とファイル方式（§3.2） |
+| Triton の実行時コンパイルに `Python.h` が要る件 | `_ensure_python_headers()` とそのメモ化 |
+| A/B・同一シード・ビット一致で確認する計測姿勢 | §5 の検証手順と `bench/` のスクリプト群 |
+
+### 本フォーク側で独自に実装・検証した部分
+
+上記リポジトリのコードは取り込んでいません（向こうは `.pth` で読み込むモンキーパッチ、
+こちらは comfy-kitchen 本体へのフォーク）。以下は本フォークで書いたもの:
+
+- タイル表（M 帯ごとに 64/128 行を選ぶ）と、GB10 以外のデバイス向けフォールバックタイル
+- residual 融合 epilogue（CUTLASS の型順序に合わせ、`torch.equal` でビット一致を検証）
+- `comfy_kitchen/tensor/scale_shift.py`（変調の融合。FMA 融合による中間丸め消失、
+  fp32 adaLN の事前丸め、非連続ビューの 3 点は実測で特定）
+- 形状別の実測（§0）と回帰テスト（`tests/test_int8.py`, `tests/test_scale_shift.py`）
+
+本フォークの誤りは本フォーク側の責任です。原典のライセンスは上記リポジトリの `LICENSE`（MIT）を参照してください。
