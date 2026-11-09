@@ -118,7 +118,7 @@ Triton's runtime compilation needs Python.h.
 
 No source code from that project is included here -- it ships import-time
 monkey-patches loaded via .pth files, whereas this fork modifies comfy_kitchen
-itself. See section 11 of SM121_FORK_GUIDE.md.
+itself. See section 11 of docs/gb10/DESIGN.md.
 
 ================================================================================
 
