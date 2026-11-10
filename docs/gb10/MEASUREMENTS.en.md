@@ -35,6 +35,13 @@ The gain is in **INT8 GEMM and modulation**. The attention difference does not c
 comes from ComfyUI's `--use-sage-attention` launch flag (SA2 53.9 ms/layer; with SDPA it is
 96.6 ms/layer and this stage becomes 2.69 → 4.86 s).
 
+> Note: the "stock" column is v0.2.40 (`cdab478`). The fork is based on v0.2.41 (`7d6a22a`), which
+> includes upstream #301 (64-bit packed load/store block quantizers and fused RMS-RoPE), but #301
+> does not touch the int8 convrot / `int8_linear` path, so the deltas here are unchanged. A fresh
+> fork-side run on `0.2.41+gb10.1` gave GEMM 3816 ms/forward, rotate+quant 285 ms, modulate
+> 433 → 154 ms and attention 96.5 → 53.7 ms (~6.94 s total); GEMM, modulation and attention match
+> this table.
+
 ---
 
 ## 3. Levers and when they apply

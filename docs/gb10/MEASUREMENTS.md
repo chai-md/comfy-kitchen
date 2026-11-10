@@ -32,6 +32,12 @@ torch 2.15.0+cu132（2026-10-30）。設計は [DESIGN.md](DESIGN.md)、手順�
 効果があるのは **INT8 GEMM と 変調**。attention はフォーク起因ではなく、ComfyUI の起動フラグ
 `--use-sage-attention` による（SA2 53.9 ms/層、SDPA だと 96.6 ms/層でこの段階が 2.69 → 4.86 s）。
 
+> 注: 本表の「素」は v0.2.40（`cdab478`）。フォークのベースは v0.2.41（`7d6a22a`）で、上流 #301
+> （CUDA ブロック量子化の 64bit packed load/store 化と fused RMS-RoPE）を含むが、#301 は
+> int8 convrot / `int8_linear` に触れないため本表の差分は不変。`0.2.41+gb10.1` で取り直した
+> フォーク側は GEMM 3816 ms/forward、rotate+quant 285 ms、modulate 433 → 154 ms、
+> attention 96.5 → 53.7 ms（合計 ~6.94 s）で、GEMM・変調・attention は本表と一致した。
+
 ---
 
 ## 3. レバーと効く条件
