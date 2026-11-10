@@ -198,3 +198,25 @@ python bench/bench_h3_breakdown.py vanilla
 The raw runs (`h3_breakdown_fork.json` / `h3_breakdown_vanilla.json`) ship in the repository. If
 upstream touches the `_TRITON_INT8_MIN_M` band or the tile table, re-take the comparison tables here
 (run `~/archive/patches/bench_int8_baseline.py` in the two states, A and `gb10-optimized`).
+
+---
+
+## 11. Bandwidth of the upstream #301 kernels (sm_121 measurement)
+
+`0.2.41+gb10.1`, M=15792, bf16 input. Effective GB/s is (bytes read + bytes written + scales) divided
+by time. The roof is a same-size bf16 copy (read+write) measured at **246.9 GB/s** (90% of the
+273 GB/s nominal peak).
+
+| Kernel | Measured | Effective GB/s | Share of copy roof |
+| :--- | ---: | ---: | ---: |
+| nvfp4 quantize | 1059.6 µs | 205.3 | 83% |
+| mxfp8 quantize | 1067.0 µs | 241.3 | **98%** |
+| int8 rowwise quantize | 1097.1 µs | 232.2 | 94% |
+| fused rms_rope (in-place) | 4024.3 µs | 229.0 | 93% |
+| rms_rope (out-of-place) | 4453.1 µs | 207.0 | 84% |
+
+- MXFP8, int8 rowwise and the fused rms_rope reach the measured roof. Only NVFP4 sits at 83%, leaving
+  0.18 ms per call at this shape (traffic: 169.7 MB read + 42.4 MB packed + 5.3 MB scales). H3's int8
+  path does not use NVFP4, so the operational impact is small.
+- rms_rope is the path H3's VAE actually calls (`rms_rope_split_half_`). The out-of-place variant runs
+  at 84%, slower than the in-place inference path.

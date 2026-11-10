@@ -190,3 +190,24 @@ python bench/bench_h3_breakdown.py vanilla
 `bench/` の生データ（`h3_breakdown_fork.json` / `h3_breakdown_vanilla.json`）はリポジトリに同梱。
 上流が `_TRITON_INT8_MIN_M` の帯域やタイル表に触れたら、本稿の比較表を取り直す
 （`~/archive/patches/bench_int8_baseline.py` を A / `gb10-optimized` の 2 状態で流す）。
+
+---
+
+## 11. 上流 #301 カーネルの帯域（sm_121 実測）
+
+`0.2.41+gb10.1`、M=15792、bf16 入力。実効 GB/s は「読んだ量＋書いた量＋スケール」を時間で割った値。
+天井は同サイズの bf16 copy（read+write）実測 **246.9 GB/s**（公称 273 の 90%）。
+
+| カーネル | 実測 | 実効 GB/s | コピー天井比 |
+| :--- | ---: | ---: | ---: |
+| nvfp4 quantize | 1059.6 µs | 205.3 | 83% |
+| mxfp8 quantize | 1067.0 µs | 241.3 | **98%** |
+| int8 rowwise quantize | 1097.1 µs | 232.2 | 94% |
+| fused rms_rope（in-place） | 4024.3 µs | 229.0 | 93% |
+| rms_rope（out-of-place） | 4453.1 µs | 207.0 | 84% |
+
+- MXFP8・int8 rowwise・fused rms_rope は実測天井に到達している。NVFP4 だけ 83% で、
+  この形状で 0.18 ms/回の余地が残る（トラフィックは read 169.7 MB + packed 42.4 MB + scales 5.3 MB）。
+  H3 の int8 経路は NVFP4 を使わないため、実運用への影響は小さい。
+- rms_rope は H3 VAE が実際に呼ぶ経路（`rms_rope_split_half_`）。out-of-place 版は 84% で、
+  推論時の in-place 経路より遅い。
