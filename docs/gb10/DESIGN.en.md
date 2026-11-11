@@ -186,12 +186,24 @@ authoritative).
 
 ---
 
-## 7. ComfyUI-side hook (`patches/comfyui-minimax-modulation.patch`)
+## 7. ComfyUI-side hook (optional — **not applied by default**)
 
-ComfyUI is an upstream clone, so the hook ships as a patch in this repository (apply per OPERATIONS
-§4). `_mod_scale_shift()` uses the comfy-kitchen kernel and, when its preconditions fail, prints the
-reason once to stderr and returns to the torch implementation (`_mod_scale_shift_ref`). We do not use
-a silent fallback — it once hid a kernel defect.
+`patches/comfyui-minimax-modulation.patch` swaps ComfyUI's `_mod_scale_shift()` onto the comfy-kitchen
+kernel. When its preconditions fail it prints the reason once to stderr and returns to the torch
+implementation (`_mod_scale_shift_ref`) — no silent fallback, which once hid a kernel defect.
+
+**Policy: as of 2026-11-11 it is not applied.** Three reasons.
+
+- The gain is small: modulation 433 → 154 ms, i.e. 0.28 s per forward — about 2.2 s over 8 steps, 1–2%
+  of a 150–250 s five-second clip. It is 0.33 s of the fork's 4.4 s (7.5%).
+- The maintenance cost is high: every upstream H3 change (#17655 rewrote 287 lines of `model.py`) moves
+  the insertion point and breaks the patch, in the file upstream changes most often.
+- It belongs upstream: ComfyUI's `AGENTS.md` makes "use an existing optimised comfy-kitchen operation
+  whenever one supports the math" a default requirement, so this fusion is a natural PR. Once merged the
+  patch disappears.
+
+`tensor/scale_shift.py` and its tests stay in the fork (material for that PR; harmless while unused).
+To re-apply, see OPERATIONS §4.
 
 ---
 

@@ -162,10 +162,13 @@ print('scale_shift bit-identical:', torch.equal(out, ref))
 
 ---
 
-## 4. ComfyUI 側フックの適用
+## 4. ComfyUI 側フックの適用（任意）
 
 ComfyUI は上流（`Comfy-Org/ComfyUI`）クローンなので push 先が無い。フックは本リポジトリの
 `patches/comfyui-minimax-modulation.patch` を適用して使う。
+
+**2026-11-11 以降、既定では適用しない**（効果 0.28 s/forward、維持コストが上回る。DESIGN §7）。
+適用する場合のみ以下を実行する。
 
 ```bash
 git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
@@ -179,11 +182,14 @@ git -C ~/ComfyUI apply -R ~/comfy-kitchen/patches/comfyui-minimax-modulation.pat
 本パッチは ComfyUI `0228a9d73`（v0.45.0）向けに更新済み。上流 #17655（H3-image 対応）で
 `_tag_runs` の直後に import ブロックが入る形に変わっており、旧版のままでは `model.py` で衝突する。
 
-### 4.1 H3 コンテキストウィンドウ修正（別パッチ）
+### 4.1 H3 コンテキストウィンドウ修正（別パッチ・任意）
 
 `model.py` の `PackedLayout` と `model_base.py` の `_window_payload` に手を入れる修正は、
 フックとは別パッチ（`~/archive/patches/comfyui-h3-contextwindow-*.diff`）で管理している。
-フック適用後に同じ要領で適用し、`check_h3_window_positions.py` で位置（video err ≲1e-9）を確認する。
+**これも既定では適用しない**。コンテキストウィンドウ（10 秒超の分割生成）を使う場合だけ必要で、
+単発生成しかしないなら不要（ウィンドウ生成自体が step 時間 +47% で、継続性も完全ではない）。
+適用する場合はフック適用後に同じ要領で適用し、`check_h3_window_positions.py` で位置
+（video err ≲1e-9）を確認する。
 
 ```bash
 git -C ~/ComfyUI apply ~/archive/patches/comfyui-h3-contextwindow-20261111.diff

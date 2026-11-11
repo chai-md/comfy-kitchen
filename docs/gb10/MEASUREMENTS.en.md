@@ -41,6 +41,11 @@ comes from ComfyUI's `--use-sage-attention` launch flag (SA2 53.9 ms/layer; with
 > fork-side run on `0.2.41+gb10.1` gave GEMM 3816 ms/forward, rotate+quant 285 ms, modulate
 > 433 → 154 ms and attention 96.5 → 53.7 ms (~6.94 s total); GEMM, modulation and attention match
 > this table.
+>
+> **The 0.16 s modulation figure assumes the ComfyUI-side hook is applied** (DESIGN §7). Without it the
+> stage returns to the torch implementation at 433 ms and the total becomes 7.33 s / **1.55x** (the
+> GEMM path alone accounts for the 4.05 s reduction). The hook has not been applied by default since
+> 2026-11-11.
 
 ---
 

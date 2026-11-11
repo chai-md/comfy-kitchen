@@ -39,7 +39,8 @@ git submodule update --init --depth 1
 source ~/ComfyUI/.venv/bin/activate          # ComfyUI に読ませる venv（ノードごとにパスが違う）
 COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
 python -m pytest tests/test_int8.py tests/test_scale_shift.py -q      # 290 passed
-git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+# 任意: ComfyUI 側フック（既定では適用しない。DESIGN §7）
+# git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 # ComfyUI を再起動して反映
 ```
 
@@ -67,7 +68,7 @@ git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 | `comfy_kitchen/__init__.py` | `torch.compiler.is_compiling()` 時の早期リターン | `torch.compile` 下で INT8 が落ちる問題を回避 | DESIGN §4 |
 | `comfy_kitchen/tensor/scale_shift.py`（新規） | per-segment 変調を1パスで実行（ビット一致） | 変調段階で 3.0x | DESIGN §5 |
 | `tests/test_int8.py`, `tests/test_scale_shift.py` | ビット一致・タイル・エッジ形状・残差の回帰 | 変更時の安全網 | DESIGN §6 |
-| `patches/comfyui-minimax-modulation.patch` | ComfyUI 側フック（`_mod_scale_shift`） | 実運用でのみ効く | DESIGN §7 |
+| `patches/comfyui-minimax-modulation.patch` | ComfyUI 側フック（`_mod_scale_shift`）。**任意・既定では未適用** | 適用時のみ変調段階が速くなる | DESIGN §7 |
 
 ---
 
@@ -76,6 +77,9 @@ git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 H3（M=15,787）の1イテレーション: **11.4 s → 7.0 s（−4.4 s / 1.63x）**。内訳は INT8 GEMM
 7.87 → 3.82 s、変調 0.49 → 0.16 s、回転・量子化と attention は不変。attention の差はフォークではなく
 ComfyUI の起動フラグ `--use-sage-attention` によるもの。
+
+ComfyUI 側フックを適用しない場合（既定）は変調が 0.49 s のままなので **7.33 s / 1.55x**。
+GEMM 経路だけで 4.05 s の短縮にあたる。
 
 効く条件は **N が広い**射影層（N ≳ 8192）で、N ≤ 4096 では 1.05〜1.06x。数値・測定条件・再測定手順は
 [MEASUREMENTS.md](docs/gb10/MEASUREMENTS.md)。

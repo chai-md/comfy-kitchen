@@ -169,12 +169,23 @@ out = scale_shift(h, scale, shift, row_mod)   # 新しいテンソルを返す�
 
 ---
 
-## 7. ComfyUI 側フック（`patches/comfyui-minimax-modulation.patch`）
+## 7. ComfyUI 側フック（任意・**既定では適用しない**）
 
-ComfyUI は上流クローンなので、フックはパッチとして本リポジトリに同梱している（適用は OPERATIONS §4）。
-`_mod_scale_shift()` が comfy-kitchen のカーネルを使い、前提が崩れたときは stderr に 1 回だけ理由を出して
-torch 実装（`_mod_scale_shift_ref`）に戻る。理由を出さないフォールバックは使わない
-（以前、カーネル側の不具合を隠した）。
+`patches/comfyui-minimax-modulation.patch` は ComfyUI の `_mod_scale_shift()` を comfy-kitchen の
+カーネルに差し替える。前提が崩れたときは stderr に 1 回だけ理由を出して torch 実装
+（`_mod_scale_shift_ref`）に戻る（無言のフォールバックは使わない。以前、カーネル側の不具合を隠した）。
+
+**適用方針**: 2026-11-11 以降は**適用しない**。理由は次の3点。
+
+- 効果が小さい: 変調段階 433 → 154 ms（1 forward あたり 0.28 s）。8 steps で約 2.2 s、
+  5 s クリップの実測 150〜250 s に対して 1〜2%。フォークの利得 4.4 s のうち 0.33 s（7.5%）に留まる。
+- 維持コストが高い: 上流の H3 改修（#17655 は `model.py` を 287 行変更）が入るたびに
+  import 挿入位置が動き、パッチが衝突する。触るのは上流で最も変化の速いファイル。
+- 上流に取り込む余地がある: ComfyUI の `AGENTS.md` は「利用可能な comfy-kitchen の最適化演算を
+  使うこと」を既定要件としており、この融合は上流PRの形が自然。取り込まれればパッチ自体が不要になる。
+
+`tensor/scale_shift.py` とそのテストはフォークに残す（上流PRの材料。未適用でも害はない）。
+再適用する場合は OPERATIONS §4。
 
 ---
 
