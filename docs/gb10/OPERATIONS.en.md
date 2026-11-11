@@ -169,10 +169,13 @@ Expected: `cap (12, 1) triton-int8 True` and `scale_shift bit-identical: True`.
 
 ---
 
-## 4. Applying the ComfyUI-side hook
+## 4. Applying the ComfyUI-side hook (optional)
 
 ComfyUI is an upstream clone (`Comfy-Org/ComfyUI`) with no push target, so the hook ships as
 `patches/comfyui-minimax-modulation.patch` in this repository.
+
+**Not applied by default since 2026-11-11** (0.28 s per forward does not pay for the maintenance;
+DESIGN §7). Run the following only when you want it.
 
 ```bash
 git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
@@ -187,11 +190,13 @@ git -C ~/ComfyUI apply -R ~/comfy-kitchen/patches/comfyui-minimax-modulation.pat
 This patch is refreshed for ComfyUI `0228a9d73` (v0.45.0). Upstream #17655 (H3-image support) moved the
 insertion point next to `_tag_runs`, so the previous revision conflicts in `model.py`.
 
-### 4.1 H3 context-window fix (separate patch)
+### 4.1 H3 context-window fix (separate patch, optional)
 
 The change to `PackedLayout` in `model.py` and `_window_payload` in `model_base.py` is kept as a
-separate patch (`~/archive/patches/comfyui-h3-contextwindow-*.diff`). Apply it after the hook the same
-way, then verify the positions with `check_h3_window_positions.py` (video err ≲1e-9).
+separate patch (`~/archive/patches/comfyui-h3-contextwindow-*.diff`). **It is also not applied by
+default.** It is only needed for context windows (split generation beyond 10 s); single-shot runs do
+not need it (windowing itself costs +47% step time and continuity is still imperfect). If you apply
+it, do so after the hook and verify the positions with `check_h3_window_positions.py` (video err ≲1e-9).
 
 ```bash
 git -C ~/ComfyUI apply ~/archive/patches/comfyui-h3-contextwindow-20261111.diff

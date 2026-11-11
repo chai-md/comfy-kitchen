@@ -37,6 +37,9 @@ torch 2.15.0+cu132（2026-10-30）。設計は [DESIGN.md](DESIGN.md)、手順�
 > int8 convrot / `int8_linear` に触れないため本表の差分は不変。`0.2.41+gb10.1` で取り直した
 > フォーク側は GEMM 3816 ms/forward、rotate+quant 285 ms、modulate 433 → 154 ms、
 > attention 96.5 → 53.7 ms（合計 ~6.94 s）で、GEMM・変調・attention は本表と一致した。
+>
+> **変調の 0.16 s は ComfyUI 側フック適用時の値**（DESIGN §7）。フックを外すと torch 実装の 433 ms に戻り、
+> 合計は 7.33 s / **1.55x**（GEMM だけで 4.05 s の短縮）。フックは 2026-11-11 以降 既定では適用しない。
 
 ---
 

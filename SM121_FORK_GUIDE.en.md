@@ -40,7 +40,8 @@ git submodule update --init --depth 1
 source ~/ComfyUI/.venv/bin/activate          # the venv ComfyUI will load from (path differs per node)
 COMFY_CUDA_ARCHS=121 uv pip install --no-build-isolation -e .
 python -m pytest tests/test_int8.py tests/test_scale_shift.py -q      # 290 passed
-git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
+# optional: ComfyUI-side hook (not applied by default; DESIGN §7)
+# git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 # restart ComfyUI to pick it up
 ```
 
@@ -69,7 +70,7 @@ git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 | `comfy_kitchen/__init__.py` | Early return under `torch.compiler.is_compiling()` | Avoids the INT8 path failing under `torch.compile` | DESIGN §4 |
 | `comfy_kitchen/tensor/scale_shift.py` (new) | Single-pass per-segment modulation, bit-identical | 3.0x on the modulation stage | DESIGN §5 |
 | `tests/test_int8.py`, `tests/test_scale_shift.py` | Bit-identity, tile, edge-shape and residual regressions | Safety net for changes | DESIGN §6 |
-| `patches/comfyui-minimax-modulation.patch` | ComfyUI-side hook (`_mod_scale_shift`) | Only pays off in real workloads | DESIGN §7 |
+| `patches/comfyui-minimax-modulation.patch` | ComfyUI-side hook (`_mod_scale_shift`); **optional, not applied by default** | Speeds up the modulation stage only when applied | DESIGN §7 |
 
 ---
 
@@ -78,6 +79,9 @@ git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 H3 (M=15,787), one iteration: **11.4 s → 7.0 s (−4.4 s / 1.63x)**. The breakdown is INT8 GEMM
 7.87 → 3.82 s and modulation 0.49 → 0.16 s; rotation, quantisation and attention are unchanged.
 The attention difference comes from ComfyUI's `--use-sage-attention` launch flag, not from the fork.
+
+Without the ComfyUI-side hook (the default) modulation stays at 0.49 s, so the total is
+**7.33 s / 1.55x**; the GEMM path alone accounts for the 4.05 s reduction.
 
 The lever applies to **wide-N** projections (N ≳ 8192); at N ≤ 4096 it is 1.05–1.06x. Numbers,
 measurement conditions and the re-measurement procedure are in
