@@ -1,8 +1,8 @@
 diff --git a/comfy/ldm/minimax/model.py b/comfy/ldm/minimax/model.py
-index 6e3884b7..0d1c6bf0 100644
+index f2ab28114..39d847cf7 100644
 --- a/comfy/ldm/minimax/model.py
 +++ b/comfy/ldm/minimax/model.py
-@@ -15,6 +15,7 @@ velocity back, so _forward only ever sees the stream's own latent.
+@@ -17,6 +17,7 @@ velocity back, so _forward only ever sees the stream's own latent.
  """
  
  import math
@@ -10,10 +10,10 @@ index 6e3884b7..0d1c6bf0 100644
  
  import torch
  import torch.nn as nn
-@@ -228,18 +229,57 @@ class AdalnProj(nn.Module):
-         return x.chunk(self.expand, dim=-1)
- 
- 
+@@ -249,6 +250,13 @@ def _tag_runs(a, b, row_base, tags):
+             runs.append((a + run_start, a + i, row_base + int(tags[run_start])))
+             run_start = i
+     return runs
 +try:
 +    from comfy_kitchen.tensor.scale_shift import scale_shift as _ck_scale_shift
 +    from comfy_kitchen.tensor.scale_shift import row_mod_from_segments as _ck_row_mod
@@ -21,10 +21,10 @@ index 6e3884b7..0d1c6bf0 100644
 +    _ck_scale_shift = None
 +    _ck_row_mod = None
 +_ck_scale_shift_warned = False
-+
-+
+ 
+ 
  def _mod_row(vecs, row, dtype):
-     # row is a mod-row index, or a per-token LongTensor of mod-row indices
+@@ -256,13 +264,43 @@ def _mod_row(vecs, row, dtype):
      return vecs[row].to(dtype)
  
  

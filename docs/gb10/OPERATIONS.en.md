@@ -180,7 +180,22 @@ git -C ~/ComfyUI apply ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 # revert (back to upstream behaviour)
 git -C ~/ComfyUI apply -R ~/comfy-kitchen/patches/comfyui-minimax-modulation.patch
 
-# re-apply after pulling upstream (if it conflicts, fix only _mod_scale_shift in model.py by hand)
+# re-apply after pulling upstream (if it conflicts, keep upstream's added lines and insert this
+# patch's import block alongside them)
+```
+
+This patch is refreshed for ComfyUI `0228a9d73` (v0.45.0). Upstream #17655 (H3-image support) moved the
+insertion point next to `_tag_runs`, so the previous revision conflicts in `model.py`.
+
+### 4.1 H3 context-window fix (separate patch)
+
+The change to `PackedLayout` in `model.py` and `_window_payload` in `model_base.py` is kept as a
+separate patch (`~/archive/patches/comfyui-h3-contextwindow-*.diff`). Apply it after the hook the same
+way, then verify the positions with `check_h3_window_positions.py` (video err ≲1e-9).
+
+```bash
+git -C ~/ComfyUI apply ~/archive/patches/comfyui-h3-contextwindow-20261111.diff
+python <skill>/scripts/check_h3_window_positions.py     # OK - windows sit at their real clip position
 ```
 
 Applying it requires a **ComfyUI restart** (Python is re-read only).
